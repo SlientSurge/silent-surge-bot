@@ -48,6 +48,8 @@ def parse_expiry_minutes(expiry_text: str) -> int:
         return 1
     if expiry_text.startswith("2"):
         return 2
+    if expiry_text.startswith("5"):
+        return 5
     return 3
 
 
@@ -274,10 +276,6 @@ def trend_exhaustion_filter(direction, closes_1m, rsi_1m):
 
 
 def expansion_filter(candles_1m, atr_1m):
-    """
-    Volume yerine daha güvenilir forex expansion filtresi:
-    son mumun range'i ATR'nin belirli yüzdesinden büyük mü?
-    """
     if not candles_1m or len(candles_1m) < 5 or atr_1m is None:
         return False
 
@@ -285,7 +283,6 @@ def expansion_filter(candles_1m, atr_1m):
     prev_ranges = [candle_range(c) for c in candles_1m[-5:-1]]
     avg_prev_range = sum(prev_ranges) / len(prev_ranges) if prev_ranges else 0
 
-    # son mum biraz canlı olacak
     if last_range < atr_1m * 0.65:
         return False
 
@@ -329,11 +326,52 @@ def update_pair_stats(symbol, result):
 
 
 # --------------------------
+# Dynamic expiry engine
+# --------------------------
+def classify_market_state(setup_type, direction, rsi_1m, trend_5m, sma_fast, sma_slow, current, mid, upper, lower):
+    """
+    REVERSAL -> 1 min
+    WEAK_TREND -> 2 min
+    STRONG_TREND -> 5 min
+    """
+    if setup_type == "EXHAUSTION_REVERSAL":
+        return "REVERSAL"
+
+    if setup_type == "BREAKOUT_RETEST":
+        if direction == "BUY" and trend_5m == "UP" and sma_fast >= sma_slow and current > mid:
+            return "STRONG_TREND"
+        if direction == "SELL" and trend_5m == "DOWN" and sma_fast <= sma_slow and current < mid:
+            return "STRONG_TREND"
+        return "WEAK_TREND"
+
+    if setup_type == "MOMENTUM_PULLBACK":
+        if direction == "BUY":
+            if trend_5m == "UP" and rsi_1m >= 42 and sma_fast >= sma_slow:
+                return "STRONG_TREND"
+            return "WEAK_TREND"
+
+        if direction == "SELL":
+            if trend_5m == "DOWN" and rsi_1m <= 58 and sma_fast <= sma_slow:
+                return "STRONG_TREND"
+            return "WEAK_TREND"
+
+    return "WEAK_TREND"
+
+
+def expiry_from_market_state(market_state):
+    if market_state == "REVERSAL":
+        return "1 min"
+    if market_state == "STRONG_TREND":
+        return "5 min"
+    return "2 min"
+
+
+# --------------------------
 # Scoring / ranking
 # --------------------------
-def get_expiry_confidence_rank(direction, current, prev, upper, lower,
-                               rsi_1m, rsi_3m, sma_fast, sma_slow,
-                               trend_5m, atr_1m, setup_type):
+def get_confidence_quality_rank(direction, current, prev, upper, lower,
+                                rsi_1m, rsi_3m, sma_fast, sma_slow,
+                                trend_5m, atr_1m, setup_type, market_state):
     confidence = 50
 
     if setup_type == "EXHAUSTION_REVERSAL":
@@ -342,6 +380,11 @@ def get_expiry_confidence_rank(direction, current, prev, upper, lower,
         confidence += 10
     elif setup_type == "MOMENTUM_PULLBACK":
         confidence += 8
+
+    if market_state == "STRONG_TREND":
+        confidence += 8
+    elif market_state == "REVERSAL":
+        confidence += 4
 
     if direction == "BUY":
         band_distance = abs(current - lower)
@@ -417,19 +460,52 @@ def get_expiry_confidence_rank(direction, current, prev, upper, lower,
     confidence = max(40, min(confidence, 95))
 
     if confidence >= 86:
-        expiry = "1 min"
         quality = "Strong"
         rank = "A+"
     elif confidence >= 74:
-        expiry = "2 min"
         quality = "Good"
         rank = "A"
     else:
-        expiry = "3 min"
         quality = "Moderate"
         rank = "B"
 
-    return expiry, confidence, quality, rank
+    return confidence, quality, rank
+
+
+# --------------------------
+# Signal builder
+# --------------------------
+def build_signal(symbol, setup, direction, current, prev, rsi_1m, rsi_3m,
+                 upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m):
+    market_state = classify_market_state(
+        setup, direction, rsi_1m, trend_5m, sma_fast, sma_slow, current, mid, upper, lower
+    )
+    expiry = expiry_from_market_state(market_state)
+    confidence, quality, rank = get_confidence_quality_rank(
+        direction, current, prev, upper, lower, rsi_1m, rsi_3m,
+        sma_fast, sma_slow, trend_5m, atr_1m, setup, market_state
+    )
+
+    return {
+        "setup": setup,
+        "market_state": market_state,
+        "symbol": symbol,
+        "direction": direction,
+        "price": round(current, 5),
+        "rsi_1m": round(rsi_1m, 2),
+        "rsi_3m": round(rsi_3m, 2) if rsi_3m is not None else "N/A",
+        "upper": round(upper, 5),
+        "mid": round(mid, 5),
+        "lower": round(lower, 5),
+        "atr_1m": round(atr_1m, 5),
+        "expiry": expiry,
+        "confidence": confidence,
+        "quality": quality,
+        "rank": rank,
+        "trend_5m": trend_5m,
+        "signal_time_utc": iso_now(),
+        "signal_time_ny": ny_now().strftime("%Y-%m-%d %H:%M:%S")
+    }
 
 
 # --------------------------
@@ -467,32 +543,14 @@ def check_exhaustion_reversal(symbol, closes_1m, closes_3m, closes_5m, atr_1m):
     if buy_trigger and (rsi_3m is None or rsi_3m < 42) and trend_5m in ["UP", "FLAT"]:
         if trend_exhaustion_filter("BUY", closes_1m, rsi_1m):
             return None
-
-        expiry, confidence, quality, rank = get_expiry_confidence_rank(
-            "BUY", current, prev, upper, lower, rsi_1m, rsi_3m,
-            sma_fast, sma_slow, trend_5m, atr_1m, "EXHAUSTION_REVERSAL"
-        )
-
-        return build_signal(
-            symbol, "EXHAUSTION_REVERSAL", "BUY", current,
-            rsi_1m, rsi_3m, upper, mid, lower, atr_1m,
-            expiry, confidence, quality, rank, trend_5m
-        )
+        return build_signal(symbol, "EXHAUSTION_REVERSAL", "BUY", current, prev, rsi_1m, rsi_3m,
+                            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m)
 
     if sell_trigger and (rsi_3m is None or rsi_3m > 58) and trend_5m in ["DOWN", "FLAT"]:
         if trend_exhaustion_filter("SELL", closes_1m, rsi_1m):
             return None
-
-        expiry, confidence, quality, rank = get_expiry_confidence_rank(
-            "SELL", current, prev, upper, lower, rsi_1m, rsi_3m,
-            sma_fast, sma_slow, trend_5m, atr_1m, "EXHAUSTION_REVERSAL"
-        )
-
-        return build_signal(
-            symbol, "EXHAUSTION_REVERSAL", "SELL", current,
-            rsi_1m, rsi_3m, upper, mid, lower, atr_1m,
-            expiry, confidence, quality, rank, trend_5m
-        )
+        return build_signal(symbol, "EXHAUSTION_REVERSAL", "SELL", current, prev, rsi_1m, rsi_3m,
+                            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m)
 
     return None
 
@@ -529,26 +587,12 @@ def check_breakout_retest(symbol, closes_1m, closes_3m, closes_5m, atr_1m):
     )
 
     if buy_trigger and (rsi_3m is None or rsi_3m > 50):
-        expiry, confidence, quality, rank = get_expiry_confidence_rank(
-            "BUY", current, prev, upper, lower, rsi_1m, rsi_3m,
-            sma_fast, sma_slow, trend_5m, atr_1m, "BREAKOUT_RETEST"
-        )
-        return build_signal(
-            symbol, "BREAKOUT_RETEST", "BUY", current,
-            rsi_1m, rsi_3m, upper, mid, lower, atr_1m,
-            expiry, confidence, quality, rank, trend_5m
-        )
+        return build_signal(symbol, "BREAKOUT_RETEST", "BUY", current, prev, rsi_1m, rsi_3m,
+                            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m)
 
     if sell_trigger and (rsi_3m is None or rsi_3m < 50):
-        expiry, confidence, quality, rank = get_expiry_confidence_rank(
-            "SELL", current, prev, upper, lower, rsi_1m, rsi_3m,
-            sma_fast, sma_slow, trend_5m, atr_1m, "BREAKOUT_RETEST"
-        )
-        return build_signal(
-            symbol, "BREAKOUT_RETEST", "SELL", current,
-            rsi_1m, rsi_3m, upper, mid, lower, atr_1m,
-            expiry, confidence, quality, rank, trend_5m
-        )
+        return build_signal(symbol, "BREAKOUT_RETEST", "SELL", current, prev, rsi_1m, rsi_3m,
+                            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m)
 
     return None
 
@@ -583,51 +627,14 @@ def check_momentum_pullback(symbol, closes_1m, closes_3m, closes_5m, atr_1m):
     )
 
     if buy_trigger and (rsi_3m is None or rsi_3m > 45):
-        expiry, confidence, quality, rank = get_expiry_confidence_rank(
-            "BUY", current, prev, upper, lower, rsi_1m, rsi_3m,
-            sma_fast, sma_slow, trend_5m, atr_1m, "MOMENTUM_PULLBACK"
-        )
-        return build_signal(
-            symbol, "MOMENTUM_PULLBACK", "BUY", current,
-            rsi_1m, rsi_3m, upper, mid, lower, atr_1m,
-            expiry, confidence, quality, rank, trend_5m
-        )
+        return build_signal(symbol, "MOMENTUM_PULLBACK", "BUY", current, prev, rsi_1m, rsi_3m,
+                            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m)
 
     if sell_trigger and (rsi_3m is None or rsi_3m < 55):
-        expiry, confidence, quality, rank = get_expiry_confidence_rank(
-            "SELL", current, prev, upper, lower, rsi_1m, rsi_3m,
-            sma_fast, sma_slow, trend_5m, atr_1m, "MOMENTUM_PULLBACK"
-        )
-        return build_signal(
-            symbol, "MOMENTUM_PULLBACK", "SELL", current,
-            rsi_1m, rsi_3m, upper, mid, lower, atr_1m,
-            expiry, confidence, quality, rank, trend_5m
-        )
+        return build_signal(symbol, "MOMENTUM_PULLBACK", "SELL", current, prev, rsi_1m, rsi_3m,
+                            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m)
 
     return None
-
-
-def build_signal(symbol, setup, direction, price, rsi_1m, rsi_3m, upper, mid, lower,
-                 atr_1m, expiry, confidence, quality, rank, trend_5m):
-    return {
-        "setup": setup,
-        "symbol": symbol,
-        "direction": direction,
-        "price": round(price, 5),
-        "rsi_1m": round(rsi_1m, 2),
-        "rsi_3m": round(rsi_3m, 2) if rsi_3m is not None else "N/A",
-        "upper": round(upper, 5),
-        "mid": round(mid, 5),
-        "lower": round(lower, 5),
-        "atr_1m": round(atr_1m, 5),
-        "expiry": expiry,
-        "confidence": confidence,
-        "quality": quality,
-        "rank": rank,
-        "trend_5m": trend_5m,
-        "signal_time_utc": iso_now(),
-        "signal_time_ny": ny_now().strftime("%Y-%m-%d %H:%M:%S")
-    }
 
 
 # --------------------------
@@ -687,6 +694,7 @@ def log_signal(signal):
         "logged_at": iso_now(),
         "pair": signal["symbol"],
         "setup": signal["setup"],
+        "market_state": signal["market_state"],
         "direction": signal["direction"],
         "expiry": signal["expiry"],
         "confidence": signal["confidence"],
@@ -755,7 +763,10 @@ def resolve_signal_results():
                 entry["resolved_at_utc"] = iso_now()
 
                 update_pair_stats(entry["pair"], result)
-                print(f"Resolved {entry['pair']} {entry['direction']} {entry['expiry']} => {result}")
+                print(
+                    f"Resolved {entry['pair']} | {entry['setup']} | "
+                    f"{entry['direction']} | {entry['expiry']} => {result}"
+                )
 
             time.sleep(20)
 
@@ -769,6 +780,7 @@ def build_message(signal):
         f"⚡ <b>SILENT SURGE PRO MAX</b>\n\n"
         f"💱 <b>PAIR:</b> {signal['symbol']}\n\n"
         f"🧩 <b>SETUP:</b> {signal['setup']}\n"
+        f"🌐 <b>MARKET STATE:</b> {signal['market_state']}\n"
         f"🏅 <b>RANK:</b> <b>{signal['rank']}</b>\n"
         f"🎯 <b>DIRECTION:</b> <b>{signal['direction']}</b>\n"
         f"⏱ <b>EXPIRY:</b> <b>{signal['expiry']}</b>\n"
@@ -817,7 +829,7 @@ def scan_loop():
                     message = build_message(signal)
                     print(
                         f"Sending signal for {symbol}: "
-                        f"{signal['setup']} | {signal['direction']} | "
+                        f"{signal['setup']} | {signal['market_state']} | {signal['direction']} | "
                         f"{signal['expiry']} | {signal['confidence']}% | {signal['rank']}"
                     )
                     send_telegram(message)
