@@ -13,17 +13,20 @@ TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-PAIRS_A = ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "NZD/USD"]
-PAIRS_B = ["EUR/JPY", "GBP/JPY", "AUD/JPY", "CAD/JPY", "EUR/GBP", "GBP/CHF"]
+# 12 pairs split into 3 groups to stay within free API limits
+PAIR_GROUPS = [
+    ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD"],
+    ["USD/CAD", "NZD/USD", "EUR/JPY", "GBP/JPY"],
+    ["AUD/JPY", "CAD/JPY", "EUR/GBP", "GBP/CHF"],
+]
 
 LAST_SIGNAL = {}
 SCAN_INTERVAL_SECONDS = 60
-COOLDOWN_SECONDS = 1800
+COOLDOWN_SECONDS = 1800  # 30 min same pair/setup/direction
 NY_TZ = ZoneInfo("America/New_York")
 
 SIGNAL_LOG = []
 MAX_LOG_ITEMS = 1000
-
 PAIR_STATS = {}
 MAX_TELEGRAM_TEXT = 3900
 
@@ -80,14 +83,14 @@ def send_telegram(message: str) -> None:
 # --------------------------
 # Data fetch
 # --------------------------
-def fetch_ohlc(symbol: str, interval: str = "1min", outputsize: int = 100):
+def fetch_ohlc(symbol: str, interval: str, outputsize: int):
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": symbol,
         "interval": interval,
         "outputsize": outputsize,
         "apikey": TWELVEDATA_API_KEY,
-        "format": "JSON"
+        "format": "JSON",
     }
 
     try:
@@ -101,7 +104,7 @@ def fetch_ohlc(symbol: str, interval: str = "1min", outputsize: int = 100):
         print(f"Bad data for {symbol} {interval}: {data}")
         return None
 
-    values = list(reversed(data["values"]))
+    values = list(reversed(data["values"]))  # oldest -> newest
     candles = []
     for v in values:
         candles.append({
@@ -110,7 +113,6 @@ def fetch_ohlc(symbol: str, interval: str = "1min", outputsize: int = 100):
             "high": float(v["high"]),
             "low": float(v["low"]),
             "close": float(v["close"]),
-            "volume": float(v["volume"]) if "volume" in v and v["volume"] not in (None, "") else None
         })
     return candles
 
@@ -209,28 +211,51 @@ def candle_range(candle):
 
 def get_5m_trend(closes_5m):
     if not closes_5m or len(closes_5m) < 20:
-        return "N/A", None, None
+        return "N/A"
 
-    sma5_fast = sma(closes_5m, 5)
-    sma5_slow = sma(closes_5m, 20)
+    fast = sma(closes_5m, 5)
+    slow = sma(closes_5m, 20)
 
-    if sma5_fast is None or sma5_slow is None:
-        return "N/A", None, None
+    if fast is None or slow is None:
+        return "N/A"
 
-    if sma5_fast > sma5_slow:
-        return "UP", sma5_fast, sma5_slow
-    elif sma5_fast < sma5_slow:
-        return "DOWN", sma5_fast, sma5_slow
-    return "FLAT", sma5_fast, sma5_slow
+    if fast > slow:
+        return "UP"
+    if fast < slow:
+        return "DOWN"
+    return "FLAT"
 
 
 # --------------------------
-# Filters
+# Regime / filters
 # --------------------------
+def detect_market_regime(price, upper, mid, lower, rsi_1m, atr_1m):
+    if None in (price, upper, mid, lower, rsi_1m, atr_1m):
+        return "UNKNOWN"
+
+    band_width = upper - lower
+    rel_band = band_width / max(price, 1e-9)
+    rel_atr = atr_1m / max(price, 1e-9)
+
+    if rel_atr < 0.00025:
+        return "DEAD"
+
+    if rel_atr > 0.0012:
+        return "EXPLOSIVE"
+
+    if rel_band < 0.0009:
+        return "RANGE"
+
+    if rsi_1m >= 58 or rsi_1m <= 42:
+        return "TREND"
+
+    return "RANGE"
+
+
 def session_filter():
-    now_ny = ny_now()
-    weekday = now_ny.weekday()
-    hour = now_ny.hour
+    now = ny_now()
+    weekday = now.weekday()
+    hour = now.hour
 
     if weekday == 5:
         return False, "Saturday"
@@ -242,17 +267,36 @@ def session_filter():
         return False, "Friday post-close"
 
     if 3 <= hour < 16:
-        return True, "Active session"
+        return True, "ACTIVE"
 
-    return False, "Low-liquidity session"
+    return False, "LOW_LIQUIDITY"
+
+
+def entry_timing_filter():
+    # Only take entries near the start of a new minute
+    sec = utc_now().second
+    return sec <= 15
 
 
 def atr_filter(atr_1m, price):
     if atr_1m is None or price <= 0:
         return False
-
     rel_atr = atr_1m / price
-    if rel_atr < 0.00035:
+    return rel_atr >= 0.00035
+
+
+def expansion_filter(candles_1m, atr_1m):
+    if not candles_1m or len(candles_1m) < 5 or atr_1m is None:
+        return False
+
+    last_range = candle_range(candles_1m[-1])
+    prev_ranges = [candle_range(c) for c in candles_1m[-5:-1]]
+    avg_prev_range = sum(prev_ranges) / len(prev_ranges) if prev_ranges else 0
+
+    if last_range < atr_1m * 0.65:
+        return False
+
+    if avg_prev_range > 0 and last_range < avg_prev_range * 0.9:
         return False
 
     return True
@@ -275,21 +319,31 @@ def trend_exhaustion_filter(direction, closes_1m, rsi_1m):
     return False
 
 
-def expansion_filter(candles_1m, atr_1m):
-    if not candles_1m or len(candles_1m) < 5 or atr_1m is None:
-        return False
+def hard_no_trade_filter(price, regime, rsi_1m, atr_1m, sma_fast, sma_slow, upper, lower):
+    if None in (price, rsi_1m, atr_1m, sma_fast, sma_slow, upper, lower):
+        return True
 
-    last_range = candle_range(candles_1m[-1])
-    prev_ranges = [candle_range(c) for c in candles_1m[-5:-1]]
-    avg_prev_range = sum(prev_ranges) / len(prev_ranges) if prev_ranges else 0
+    # dead market
+    if regime == "DEAD":
+        return True
 
-    if last_range < atr_1m * 0.65:
-        return False
+    # too explosive -> avoid random spike trades
+    if regime == "EXPLOSIVE":
+        return True
 
-    if avg_prev_range > 0 and last_range < avg_prev_range * 0.9:
-        return False
+    # band too tight
+    if (upper - lower) < price * 0.0008:
+        return True
 
-    return True
+    # indecisive RSI
+    if 45 < rsi_1m < 55:
+        return True
+
+    # flat averages
+    if abs(sma_fast - sma_slow) < price * 0.0001:
+        return True
+
+    return False
 
 
 # --------------------------
@@ -318,22 +372,14 @@ def update_pair_stats(symbol, result):
     elif result == "DRAW":
         stats["draws"] += 1
 
-    total_decisive = stats["wins"] + stats["losses"]
-    if total_decisive > 0:
-        stats["win_rate"] = round((stats["wins"] / total_decisive) * 100, 2)
-    else:
-        stats["win_rate"] = 0.0
+    decisive = stats["wins"] + stats["losses"]
+    stats["win_rate"] = round((stats["wins"] / decisive) * 100, 2) if decisive else 0.0
 
 
 # --------------------------
 # Dynamic expiry engine
 # --------------------------
-def classify_market_state(setup_type, direction, rsi_1m, trend_5m, sma_fast, sma_slow, current, mid, upper, lower):
-    """
-    REVERSAL -> 1 min
-    WEAK_TREND -> 2 min
-    STRONG_TREND -> 5 min
-    """
+def classify_market_state(setup_type, direction, rsi_1m, trend_5m, sma_fast, sma_slow, current, mid):
     if setup_type == "EXHAUSTION_REVERSAL":
         return "REVERSAL"
 
@@ -349,7 +395,6 @@ def classify_market_state(setup_type, direction, rsi_1m, trend_5m, sma_fast, sma
             if trend_5m == "UP" and rsi_1m >= 42 and sma_fast >= sma_slow:
                 return "STRONG_TREND"
             return "WEAK_TREND"
-
         if direction == "SELL":
             if trend_5m == "DOWN" and rsi_1m <= 58 and sma_fast <= sma_slow:
                 return "STRONG_TREND"
@@ -370,10 +415,11 @@ def expiry_from_market_state(market_state):
 # Scoring / ranking
 # --------------------------
 def get_confidence_quality_rank(direction, current, prev, upper, lower,
-                                rsi_1m, rsi_3m, sma_fast, sma_slow,
+                                rsi_1m, sma_fast, sma_slow,
                                 trend_5m, atr_1m, setup_type, market_state):
     confidence = 50
 
+    # base by setup
     if setup_type == "EXHAUSTION_REVERSAL":
         confidence += 6
     elif setup_type == "BREAKOUT_RETEST":
@@ -381,6 +427,7 @@ def get_confidence_quality_rank(direction, current, prev, upper, lower,
     elif setup_type == "MOMENTUM_PULLBACK":
         confidence += 8
 
+    # market state bonus
     if market_state == "STRONG_TREND":
         confidence += 8
     elif market_state == "REVERSAL":
@@ -395,12 +442,6 @@ def get_confidence_quality_rank(direction, current, prev, upper, lower,
             confidence += 10
         elif rsi_1m < 35:
             confidence += 6
-
-        if rsi_3m is not None:
-            if rsi_3m < 32:
-                confidence += 12
-            elif rsi_3m < 40:
-                confidence += 7
 
         if current > prev:
             confidence += 8
@@ -427,12 +468,6 @@ def get_confidence_quality_rank(direction, current, prev, upper, lower,
             confidence += 10
         elif rsi_1m > 65:
             confidence += 6
-
-        if rsi_3m is not None:
-            if rsi_3m > 68:
-                confidence += 12
-            elif rsi_3m > 60:
-                confidence += 7
 
         if current < prev:
             confidence += 8
@@ -473,17 +508,17 @@ def get_confidence_quality_rank(direction, current, prev, upper, lower,
 
 
 # --------------------------
-# Signal builder
+# Build signal
 # --------------------------
-def build_signal(symbol, setup, direction, current, prev, rsi_1m, rsi_3m,
+def build_signal(symbol, setup, direction, current, prev, rsi_1m,
                  upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m):
     market_state = classify_market_state(
-        setup, direction, rsi_1m, trend_5m, sma_fast, sma_slow, current, mid, upper, lower
+        setup, direction, rsi_1m, trend_5m, sma_fast, sma_slow, current, mid
     )
     expiry = expiry_from_market_state(market_state)
     confidence, quality, rank = get_confidence_quality_rank(
-        direction, current, prev, upper, lower, rsi_1m, rsi_3m,
-        sma_fast, sma_slow, trend_5m, atr_1m, setup, market_state
+        direction, current, prev, upper, lower,
+        rsi_1m, sma_fast, sma_slow, trend_5m, atr_1m, setup, market_state
     )
 
     return {
@@ -493,7 +528,6 @@ def build_signal(symbol, setup, direction, current, prev, rsi_1m, rsi_3m,
         "direction": direction,
         "price": round(current, 5),
         "rsi_1m": round(rsi_1m, 2),
-        "rsi_3m": round(rsi_3m, 2) if rsi_3m is not None else "N/A",
         "upper": round(upper, 5),
         "mid": round(mid, 5),
         "lower": round(lower, 5),
@@ -511,7 +545,7 @@ def build_signal(symbol, setup, direction, current, prev, rsi_1m, rsi_3m,
 # --------------------------
 # Setups
 # --------------------------
-def check_exhaustion_reversal(symbol, closes_1m, closes_3m, closes_5m, atr_1m):
+def check_exhaustion_reversal(symbol, closes_1m, closes_5m, atr_1m):
     current = closes_1m[-1]
     prev = closes_1m[-2]
 
@@ -519,12 +553,10 @@ def check_exhaustion_reversal(symbol, closes_1m, closes_3m, closes_5m, atr_1m):
     rsi_1m = rsi(closes_1m, 14)
     sma_fast = sma(closes_1m, 5)
     sma_slow = sma(closes_1m, 20)
+    trend_5m = get_5m_trend(closes_5m)
 
     if None in (upper, mid, lower, rsi_1m, sma_fast, sma_slow):
         return None
-
-    rsi_3m = rsi(closes_3m, 14) if closes_3m and len(closes_3m) >= 20 else None
-    trend_5m, _, _ = get_5m_trend(closes_5m)
 
     buy_trigger = (
         current <= lower * 1.002 and
@@ -540,22 +572,22 @@ def check_exhaustion_reversal(symbol, closes_1m, closes_3m, closes_5m, atr_1m):
         sma_fast <= sma_slow * 1.002
     )
 
-    if buy_trigger and (rsi_3m is None or rsi_3m < 42) and trend_5m in ["UP", "FLAT"]:
+    if buy_trigger and trend_5m in ["UP", "FLAT"]:
         if trend_exhaustion_filter("BUY", closes_1m, rsi_1m):
             return None
-        return build_signal(symbol, "EXHAUSTION_REVERSAL", "BUY", current, prev, rsi_1m, rsi_3m,
+        return build_signal(symbol, "EXHAUSTION_REVERSAL", "BUY", current, prev, rsi_1m,
                             upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m)
 
-    if sell_trigger and (rsi_3m is None or rsi_3m > 58) and trend_5m in ["DOWN", "FLAT"]:
+    if sell_trigger and trend_5m in ["DOWN", "FLAT"]:
         if trend_exhaustion_filter("SELL", closes_1m, rsi_1m):
             return None
-        return build_signal(symbol, "EXHAUSTION_REVERSAL", "SELL", current, prev, rsi_1m, rsi_3m,
+        return build_signal(symbol, "EXHAUSTION_REVERSAL", "SELL", current, prev, rsi_1m,
                             upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m)
 
     return None
 
 
-def check_breakout_retest(symbol, closes_1m, closes_3m, closes_5m, atr_1m):
+def check_breakout_retest(symbol, closes_1m, closes_5m, atr_1m):
     current = closes_1m[-1]
     prev = closes_1m[-2]
 
@@ -563,12 +595,10 @@ def check_breakout_retest(symbol, closes_1m, closes_3m, closes_5m, atr_1m):
     rsi_1m = rsi(closes_1m, 14)
     sma_fast = sma(closes_1m, 5)
     sma_slow = sma(closes_1m, 20)
+    trend_5m = get_5m_trend(closes_5m)
 
     if None in (upper, mid, lower, rsi_1m, sma_fast, sma_slow):
         return None
-
-    rsi_3m = rsi(closes_3m, 14) if closes_3m and len(closes_3m) >= 20 else None
-    trend_5m, _, _ = get_5m_trend(closes_5m)
 
     buy_trigger = (
         trend_5m == "UP" and
@@ -586,18 +616,18 @@ def check_breakout_retest(symbol, closes_1m, closes_3m, closes_5m, atr_1m):
         sma_fast <= sma_slow
     )
 
-    if buy_trigger and (rsi_3m is None or rsi_3m > 50):
-        return build_signal(symbol, "BREAKOUT_RETEST", "BUY", current, prev, rsi_1m, rsi_3m,
+    if buy_trigger:
+        return build_signal(symbol, "BREAKOUT_RETEST", "BUY", current, prev, rsi_1m,
                             upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m)
 
-    if sell_trigger and (rsi_3m is None or rsi_3m < 50):
-        return build_signal(symbol, "BREAKOUT_RETEST", "SELL", current, prev, rsi_1m, rsi_3m,
+    if sell_trigger:
+        return build_signal(symbol, "BREAKOUT_RETEST", "SELL", current, prev, rsi_1m,
                             upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m)
 
     return None
 
 
-def check_momentum_pullback(symbol, closes_1m, closes_3m, closes_5m, atr_1m):
+def check_momentum_pullback(symbol, closes_1m, closes_5m, atr_1m):
     current = closes_1m[-1]
     prev = closes_1m[-2]
 
@@ -605,12 +635,10 @@ def check_momentum_pullback(symbol, closes_1m, closes_3m, closes_5m, atr_1m):
     rsi_1m = rsi(closes_1m, 14)
     sma_fast = sma(closes_1m, 5)
     sma_slow = sma(closes_1m, 20)
+    trend_5m = get_5m_trend(closes_5m)
 
     if None in (upper, mid, lower, rsi_1m, sma_fast, sma_slow):
         return None
-
-    rsi_3m = rsi(closes_3m, 14) if closes_3m and len(closes_3m) >= 20 else None
-    trend_5m, _, _ = get_5m_trend(closes_5m)
 
     buy_trigger = (
         trend_5m == "UP" and
@@ -626,12 +654,12 @@ def check_momentum_pullback(symbol, closes_1m, closes_3m, closes_5m, atr_1m):
         current < mid * 1.002
     )
 
-    if buy_trigger and (rsi_3m is None or rsi_3m > 45):
-        return build_signal(symbol, "MOMENTUM_PULLBACK", "BUY", current, prev, rsi_1m, rsi_3m,
+    if buy_trigger:
+        return build_signal(symbol, "MOMENTUM_PULLBACK", "BUY", current, prev, rsi_1m,
                             upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m)
 
-    if sell_trigger and (rsi_3m is None or rsi_3m < 55):
-        return build_signal(symbol, "MOMENTUM_PULLBACK", "SELL", current, prev, rsi_1m, rsi_3m,
+    if sell_trigger:
+        return build_signal(symbol, "MOMENTUM_PULLBACK", "SELL", current, prev, rsi_1m,
                             upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m)
 
     return None
@@ -640,37 +668,50 @@ def check_momentum_pullback(symbol, closes_1m, closes_3m, closes_5m, atr_1m):
 # --------------------------
 # Engine
 # --------------------------
-def signal_for_symbol(symbol: str):
+def signal_for_symbol(symbol):
     candles_1m = fetch_ohlc(symbol, "1min", 100)
-    candles_3m = fetch_ohlc(symbol, "3min", 60)
     candles_5m = fetch_ohlc(symbol, "5min", 50)
 
-    if not candles_1m or len(candles_1m) < 25:
+    if not candles_1m or len(candles_1m) < 25 or not candles_5m:
         return None
 
     closes_1m = closes_from_ohlc(candles_1m)
-    closes_3m = closes_from_ohlc(candles_3m) if candles_3m else None
-    closes_5m = closes_from_ohlc(candles_5m) if candles_5m else None
+    closes_5m = closes_from_ohlc(candles_5m)
 
     current = closes_1m[-1]
+    upper, mid, lower = bollinger(closes_1m, 20, 2)
+    rsi_1m = rsi(closes_1m, 14)
+    sma_fast = sma(closes_1m, 5)
+    sma_slow = sma(closes_1m, 20)
     atr_1m = atr(candles_1m, 14)
 
-    if atr_1m is None or not atr_filter(atr_1m, current):
+    if None in (current, upper, mid, lower, rsi_1m, sma_fast, sma_slow, atr_1m):
+        return None
+
+    regime = detect_market_regime(current, upper, mid, lower, rsi_1m, atr_1m)
+
+    if not atr_filter(atr_1m, current):
         return None
 
     if not expansion_filter(candles_1m, atr_1m):
         return None
 
-    signal = check_exhaustion_reversal(symbol, closes_1m, closes_3m, closes_5m, atr_1m)
+    if hard_no_trade_filter(current, regime, rsi_1m, atr_1m, sma_fast, sma_slow, upper, lower):
+        return None
+
+    signal = check_exhaustion_reversal(symbol, closes_1m, closes_5m, atr_1m)
     if signal:
+        signal["regime"] = regime
         return signal
 
-    signal = check_breakout_retest(symbol, closes_1m, closes_3m, closes_5m, atr_1m)
+    signal = check_breakout_retest(symbol, closes_1m, closes_5m, atr_1m)
     if signal:
+        signal["regime"] = regime
         return signal
 
-    signal = check_momentum_pullback(symbol, closes_1m, closes_3m, closes_5m, atr_1m)
+    signal = check_momentum_pullback(symbol, closes_1m, closes_5m, atr_1m)
     if signal:
+        signal["regime"] = regime
         return signal
 
     return None
@@ -694,6 +735,7 @@ def log_signal(signal):
         "logged_at": iso_now(),
         "pair": signal["symbol"],
         "setup": signal["setup"],
+        "regime": signal.get("regime", "UNKNOWN"),
         "market_state": signal["market_state"],
         "direction": signal["direction"],
         "expiry": signal["expiry"],
@@ -703,7 +745,6 @@ def log_signal(signal):
         "trend_5m": signal["trend_5m"],
         "entry_price": signal["price"],
         "rsi_1m": signal["rsi_1m"],
-        "rsi_3m": signal["rsi_3m"],
         "atr_1m": signal["atr_1m"],
         "bb_upper": signal["upper"],
         "bb_mid": signal["mid"],
@@ -743,19 +784,9 @@ def resolve_signal_results():
                 direction = entry["direction"]
 
                 if direction == "BUY":
-                    if latest_price > entry_price:
-                        result = "WIN"
-                    elif latest_price < entry_price:
-                        result = "LOSS"
-                    else:
-                        result = "DRAW"
+                    result = "WIN" if latest_price > entry_price else "LOSS" if latest_price < entry_price else "DRAW"
                 else:
-                    if latest_price < entry_price:
-                        result = "WIN"
-                    elif latest_price > entry_price:
-                        result = "LOSS"
-                    else:
-                        result = "DRAW"
+                    result = "WIN" if latest_price < entry_price else "LOSS" if latest_price > entry_price else "DRAW"
 
                 entry["status"] = "CLOSED"
                 entry["result"] = result
@@ -777,10 +808,11 @@ def resolve_signal_results():
 
 def build_message(signal):
     return (
-        f"⚡ <b>SILENT SURGE PRO MAX</b>\n\n"
+        f"⚡ <b>SILENT SURGE FINAL CORE</b>\n\n"
         f"💱 <b>PAIR:</b> {signal['symbol']}\n\n"
         f"🧩 <b>SETUP:</b> {signal['setup']}\n"
-        f"🌐 <b>MARKET STATE:</b> {signal['market_state']}\n"
+        f"🌐 <b>REGIME:</b> {signal.get('regime', 'UNKNOWN')}\n"
+        f"📍 <b>MARKET STATE:</b> {signal['market_state']}\n"
         f"🏅 <b>RANK:</b> <b>{signal['rank']}</b>\n"
         f"🎯 <b>DIRECTION:</b> <b>{signal['direction']}</b>\n"
         f"⏱ <b>EXPIRY:</b> <b>{signal['expiry']}</b>\n"
@@ -789,7 +821,6 @@ def build_message(signal):
         f"🧭 <b>5M TREND:</b> {signal['trend_5m']}\n\n"
         f"💰 <b>PRICE:</b> {signal['price']}\n"
         f"📈 <b>RSI 1M:</b> {signal['rsi_1m']}\n"
-        f"📈 <b>RSI 3M:</b> {signal['rsi_3m']}\n"
         f"🌊 <b>ATR 1M:</b> {signal['atr_1m']}\n"
         f"📉 <b>BB UPPER:</b> {signal['upper']}\n"
         f"➖ <b>BB MID:</b> {signal['mid']}\n"
@@ -806,15 +837,20 @@ def scan_loop():
 
     while True:
         try:
-            can_trade, reason = session_filter()
-
+            can_trade, session_state = session_filter()
             if not can_trade:
-                print(f"Session blocked: {reason}")
+                print(f"Session blocked: {session_state}")
                 time.sleep(SCAN_INTERVAL_SECONDS)
                 continue
 
+            if not entry_timing_filter():
+                print("Entry timing blocked")
+                time.sleep(5)
+                continue
+
             minute = utc_now().minute
-            group = PAIRS_A if minute % 2 == 0 else PAIRS_B
+            group_idx = minute % len(PAIR_GROUPS)
+            group = PAIR_GROUPS[group_idx]
 
             print(f"Scanning group: {group}")
 
@@ -829,8 +865,9 @@ def scan_loop():
                     message = build_message(signal)
                     print(
                         f"Sending signal for {symbol}: "
-                        f"{signal['setup']} | {signal['market_state']} | {signal['direction']} | "
-                        f"{signal['expiry']} | {signal['confidence']}% | {signal['rank']}"
+                        f"{signal['setup']} | {signal['market_state']} | "
+                        f"{signal['direction']} | {signal['expiry']} | "
+                        f"{signal['confidence']}% | {signal['rank']}"
                     )
                     send_telegram(message)
 
@@ -846,7 +883,7 @@ def scan_loop():
 # --------------------------
 @app.route("/", methods=["GET"])
 def home():
-    return "Silent Surge Forex Scanner Running"
+    return "Silent Surge Final Core Running"
 
 
 @app.route("/health", methods=["GET"])
