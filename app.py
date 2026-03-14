@@ -879,29 +879,3 @@ start_resolver()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-Çok net özet
-
-Bu sürüm artık:
-
-sinyali üretir
-
-Telegram’a yollar
-
-kaydeder
-
-expiry dolunca sonucu çözer
-
-parite bazlı win rate tutar
-
-Sonraki mantıklı adım
-
-Bundan sonra gerçekten tek büyük upgrade kalıyor:
-
-execution layer
-yani semi-auto / auto trade katmanı.
-
-Ama ona geçmeden önce bu sürümden birkaç gün veri toplamak en doğrusu olur.
-
-Sabah bunu yükle.
-Sonra istersen bir sonraki adımda sana
-/signals ve /stats ekranlarını nasıl okuyacağını anlatırım.
