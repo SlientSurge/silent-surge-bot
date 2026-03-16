@@ -253,23 +253,8 @@ def detect_market_regime(price, upper, mid, lower, rsi_1m, atr_1m):
 
 
 def session_filter():
-    now = ny_now()
-    weekday = now.weekday()
-    hour = now.hour
-
-    if weekday == 5:
-        return False, "Saturday"
-
-    if weekday == 6 and hour < 17:
-        return False, "Sunday pre-open"
-
-    if weekday == 4 and hour >= 17:
-        return False, "Friday post-close"
-
-    if 3 <= hour < 16:
-        return True, "ACTIVE"
-
-    return False, "LOW_LIQUIDITY"
+    # Always active for testing / full-time scanning
+    return True, "ACTIVE"
 
 
 def entry_timing_filter():
