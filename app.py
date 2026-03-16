@@ -30,9 +30,6 @@ MAX_LOG_ITEMS = 1000
 PAIR_STATS = {}
 MAX_TELEGRAM_TEXT = 3900
 
-HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "SilentSurgeBot/2.0"})
-
 
 # --------------------------
 # Time helpers
@@ -50,34 +47,22 @@ def iso_now():
 
 
 def parse_expiry_minutes(expiry_text: str) -> int:
-    txt = (expiry_text or "").strip().lower()
-    if txt.startswith("1"):
+    if expiry_text.startswith("1"):
         return 1
-    if txt.startswith("2"):
+    if expiry_text.startswith("2"):
         return 2
-    if txt.startswith("5"):
+    if expiry_text.startswith("5"):
         return 5
     return 3
-
-
-def parse_td_datetime(dt_str: str):
-    """
-    TwelveData datetime usually returns naive 'YYYY-MM-DD HH:MM:SS'.
-    We treat it as UTC for grouping consistency.
-    """
-    try:
-        return datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-    except Exception:
-        return None
 
 
 # --------------------------
 # Telegram
 # --------------------------
-def send_telegram(message: str) -> bool:
+def send_telegram(message: str) -> None:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram env vars missing.", flush=True)
-        return False
+        return
 
     if len(message) > MAX_TELEGRAM_TEXT:
         message = message[:MAX_TELEGRAM_TEXT]
@@ -90,101 +75,50 @@ def send_telegram(message: str) -> bool:
     }
 
     try:
-        r = HTTP.post(url, json=payload, timeout=15)
-        if r.status_code != 200:
-            print(f"Telegram HTTP error {r.status_code}: {r.text}", flush=True)
-            return False
-        return True
+        requests.post(url, json=payload, timeout=15)
     except Exception as e:
         print(f"Telegram error: {e}", flush=True)
-        return False
 
 
 # --------------------------
 # Data fetch
 # --------------------------
-def fetch_ohlc_1m(symbol: str, outputsize: int = 120):
-    if not TWELVEDATA_API_KEY:
-        print("TWELVEDATA_API_KEY missing.", flush=True)
-        return None
-
+def fetch_ohlc(symbol: str, interval: str, outputsize: int):
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": symbol,
-        "interval": "1min",
+        "interval": interval,
         "outputsize": outputsize,
         "apikey": TWELVEDATA_API_KEY,
         "format": "JSON",
     }
 
     try:
-        r = HTTP.get(url, params=params, timeout=20)
+        r = requests.get(url, params=params, timeout=20)
         data = r.json()
     except Exception as e:
-        print(f"Fetch error for {symbol} 1min: {e}", flush=True)
+        print(f"Fetch error for {symbol} {interval}: {e}", flush=True)
         return None
 
     if "values" not in data:
-        print(f"Bad data for {symbol} 1min: {data}", flush=True)
+        print(f"Bad data for {symbol} {interval}: {data}", flush=True)
         return None
 
     values = list(reversed(data["values"]))  # oldest -> newest
     candles = []
-
     for v in values:
-        try:
-            candles.append({
-                "datetime": v.get("datetime"),
-                "open": float(v["open"]),
-                "high": float(v["high"]),
-                "low": float(v["low"]),
-                "close": float(v["close"]),
-            })
-        except Exception:
-            continue
-
-    return candles if candles else None
-
-
-def build_5m_candles_from_1m(candles_1m):
-    """
-    Aggregates 1-minute candles into 5-minute candles.
-    This keeps the 5m logic alive without making a second API request.
-    """
-    if not candles_1m or len(candles_1m) < 5:
-        return None
-
-    buckets = {}
-
-    for c in candles_1m:
-        dt = parse_td_datetime(c["datetime"])
-        if dt is None:
-            continue
-
-        minute_floor = dt.minute - (dt.minute % 5)
-        bucket_dt = dt.replace(minute=minute_floor, second=0, microsecond=0)
-        key = bucket_dt.isoformat()
-
-        if key not in buckets:
-            buckets[key] = {
-                "datetime": bucket_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                "open": c["open"],
-                "high": c["high"],
-                "low": c["low"],
-                "close": c["close"],
-            }
-        else:
-            buckets[key]["high"] = max(buckets[key]["high"], c["high"])
-            buckets[key]["low"] = min(buckets[key]["low"], c["low"])
-            buckets[key]["close"] = c["close"]
-
-    result = list(buckets.values())
-    result.sort(key=lambda x: x["datetime"])
-    return result if len(result) >= 20 else result
+        candles.append({
+            "datetime": v.get("datetime"),
+            "open": float(v["open"]),
+            "high": float(v["high"]),
+            "low": float(v["low"]),
+            "close": float(v["close"]),
+        })
+    return candles
 
 
 def fetch_latest_price(symbol: str):
-    candles = fetch_ohlc_1m(symbol, 2)
+    candles = fetch_ohlc(symbol, "1min", 2)
     if not candles:
         return None
     return candles[-1]["close"]
@@ -319,11 +253,28 @@ def detect_market_regime(price, upper, mid, lower, rsi_1m, atr_1m):
 
 
 def session_filter():
-    # Always active
-    return True, "ACTIVE"
+    now = ny_now()
+    weekday = now.weekday()
+    hour = now.hour
+
+    if weekday == 5:
+        return False, "Saturday"
+
+    if weekday == 6 and hour < 17:
+        return False, "Sunday pre-open"
+
+    if weekday == 4 and hour >= 17:
+        return False, "Friday post-close"
+
+    # Tokyo/London geçişi dahil kalsın
+    if 3 <= hour < 16:
+        return True, "ACTIVE"
+
+    return False, "LOW_LIQUIDITY"
 
 
 def entry_timing_filter():
+    # Test/live hybrid mode: lock etmiyoruz
     return True
 
 
@@ -358,11 +309,11 @@ def trend_exhaustion_filter(direction, closes_1m, rsi_1m):
     c2, c3, c4 = closes_1m[-3], closes_1m[-2], closes_1m[-1]
 
     if direction == "BUY":
-        if c4 < c3 < c2 and rsi_1m < 25:
+        if c4 < c3 < c2 and rsi_1m < 22:
             return True
 
     if direction == "SELL":
-        if c4 > c3 > c2 and rsi_1m > 75:
+        if c4 > c3 > c2 and rsi_1m > 78:
             return True
 
     return False
@@ -458,11 +409,9 @@ def expiry_from_market_state(market_state):
 # --------------------------
 # Scoring / ranking
 # --------------------------
-def get_confidence_quality_rank(
-    direction, current, prev, upper, lower,
-    rsi_1m, sma_fast, sma_slow,
-    trend_5m, atr_1m, setup_type, market_state
-):
+def get_confidence_quality_rank(direction, current, prev, upper, lower,
+                                rsi_1m, sma_fast, sma_slow,
+                                trend_5m, atr_1m, setup_type, market_state):
     confidence = 50
 
     if setup_type == "EXHAUSTION_REVERSAL":
@@ -473,19 +422,19 @@ def get_confidence_quality_rank(
         confidence += 8
 
     if market_state == "STRONG_TREND":
-        confidence += 8
+        confidence += 6
     elif market_state == "REVERSAL":
         confidence += 4
 
     if direction == "BUY":
         band_distance = abs(current - lower)
 
-        if rsi_1m < 28:
-            confidence += 14
-        elif rsi_1m < 32:
+        if rsi_1m < 25:
+            confidence += 16
+        elif rsi_1m < 30:
             confidence += 10
         elif rsi_1m < 35:
-            confidence += 6
+            confidence += 5
 
         if current > prev:
             confidence += 8
@@ -493,25 +442,25 @@ def get_confidence_quality_rank(
         if sma_fast >= sma_slow:
             confidence += 10
         elif sma_fast >= sma_slow * 0.998:
-            confidence += 5
+            confidence += 4
 
         if trend_5m in ["UP", "FLAT"]:
             confidence += 12
         elif trend_5m == "DOWN":
-            confidence -= 10
+            confidence -= 12
 
-        if band_distance / max(current, 1e-9) < 0.0008:
+        if band_distance / max(current, 1e-9) < 0.0006:
             confidence += 8
 
     elif direction == "SELL":
         band_distance = abs(current - upper)
 
-        if rsi_1m > 72:
-            confidence += 14
-        elif rsi_1m > 68:
+        if rsi_1m > 75:
+            confidence += 16
+        elif rsi_1m > 70:
             confidence += 10
         elif rsi_1m > 65:
-            confidence += 6
+            confidence += 5
 
         if current < prev:
             confidence += 8
@@ -519,29 +468,29 @@ def get_confidence_quality_rank(
         if sma_fast <= sma_slow:
             confidence += 10
         elif sma_fast <= sma_slow * 1.002:
-            confidence += 5
+            confidence += 4
 
         if trend_5m in ["DOWN", "FLAT"]:
             confidence += 12
         elif trend_5m == "UP":
-            confidence -= 10
+            confidence -= 12
 
-        if band_distance / max(current, 1e-9) < 0.0008:
+        if band_distance / max(current, 1e-9) < 0.0006:
             confidence += 8
 
     if atr_1m is not None:
         rel_atr = atr_1m / max(current, 1e-9)
         if rel_atr > 0.0007:
-            confidence += 6
+            confidence += 5
         elif rel_atr > 0.0005:
-            confidence += 3
+            confidence += 2
 
     confidence = max(40, min(confidence, 95))
 
-    if confidence >= 86:
+    if confidence >= 92:
         quality = "Strong"
         rank = "A+"
-    elif confidence >= 74:
+    elif confidence >= 80:
         quality = "Good"
         rank = "A"
     else:
@@ -603,17 +552,17 @@ def check_exhaustion_reversal(symbol, closes_1m, closes_5m, atr_1m):
         return None
 
     buy_trigger = (
-        current <= lower * 1.002 and
-        rsi_1m < 32 and
+        current <= lower * 1.0015 and
+        rsi_1m <= 25 and
         current > prev and
-        sma_fast >= sma_slow * 0.998
+        sma_fast >= sma_slow * 0.997
     )
 
     sell_trigger = (
-        current >= upper * 0.998 and
-        rsi_1m > 68 and
+        current >= upper * 0.9985 and
+        rsi_1m >= 75 and
         current < prev and
-        sma_fast <= sma_slow * 1.002
+        sma_fast <= sma_slow * 1.003
     )
 
     if buy_trigger and trend_5m in ["UP", "FLAT"]:
@@ -650,18 +599,18 @@ def check_breakout_retest(symbol, closes_1m, closes_5m, atr_1m):
 
     buy_trigger = (
         trend_5m == "UP" and
-        current > mid and
-        prev <= mid * 1.001 and
-        rsi_1m > 52 and
-        sma_fast >= sma_slow
+        current > mid * 1.0001 and
+        prev <= mid * 1.0008 and
+        52 <= rsi_1m <= 70 and
+        sma_fast >= sma_slow * 1.00005
     )
 
     sell_trigger = (
         trend_5m == "DOWN" and
-        current < mid and
-        prev >= mid * 0.999 and
-        rsi_1m < 48 and
-        sma_fast <= sma_slow
+        current < mid * 0.9999 and
+        prev >= mid * 0.9992 and
+        30 <= rsi_1m <= 48 and
+        sma_fast <= sma_slow * 0.99995
     )
 
     if buy_trigger:
@@ -694,16 +643,18 @@ def check_momentum_pullback(symbol, closes_1m, closes_5m, atr_1m):
 
     buy_trigger = (
         trend_5m == "UP" and
-        38 <= rsi_1m <= 48 and
+        42 <= rsi_1m <= 49 and
         current > prev and
-        current > mid * 0.998
+        current > mid * 0.9995 and
+        sma_fast >= sma_slow
     )
 
     sell_trigger = (
         trend_5m == "DOWN" and
-        52 <= rsi_1m <= 62 and
+        51 <= rsi_1m <= 58 and
         current < prev and
-        current < mid * 1.002
+        current < mid * 1.0005 and
+        sma_fast <= sma_slow
     )
 
     if buy_trigger:
@@ -725,12 +676,10 @@ def check_momentum_pullback(symbol, closes_1m, closes_5m, atr_1m):
 # Engine
 # --------------------------
 def signal_for_symbol(symbol):
-    candles_1m = fetch_ohlc_1m(symbol, 120)
-    if not candles_1m or len(candles_1m) < 30:
-        return None
+    candles_1m = fetch_ohlc(symbol, "1min", 100)
+    candles_5m = fetch_ohlc(symbol, "5min", 50)
 
-    candles_5m = build_5m_candles_from_1m(candles_1m)
-    if not candles_5m or len(candles_5m) < 20:
+    if not candles_1m or len(candles_1m) < 25 or not candles_5m:
         return None
 
     closes_1m = closes_from_ohlc(candles_1m)
@@ -779,12 +728,12 @@ def should_send(signal):
     key = f"{signal['symbol']}:{signal['direction']}:{signal['setup']}"
     now_ts = time.time()
     last_time = LAST_SIGNAL.get(key, 0)
-    return (now_ts - last_time) >= COOLDOWN_SECONDS
 
+    if now_ts - last_time < COOLDOWN_SECONDS:
+        return False
 
-def mark_signal_sent(signal):
-    key = f"{signal['symbol']}:{signal['direction']}:{signal['setup']}"
-    LAST_SIGNAL[key] = time.time()
+    LAST_SIGNAL[key] = now_ts
+    return True
 
 
 def log_signal(signal):
@@ -844,17 +793,9 @@ def resolve_signal_results():
                 direction = entry["direction"]
 
                 if direction == "BUY":
-                    result = (
-                        "WIN" if latest_price > entry_price
-                        else "LOSS" if latest_price < entry_price
-                        else "DRAW"
-                    )
+                    result = "WIN" if latest_price > entry_price else "LOSS" if latest_price < entry_price else "DRAW"
                 else:
-                    result = (
-                        "WIN" if latest_price < entry_price
-                        else "LOSS" if latest_price > entry_price
-                        else "DRAW"
-                    )
+                    result = "WIN" if latest_price < entry_price else "LOSS" if latest_price > entry_price else "DRAW"
 
                 entry["status"] = "CLOSED"
                 entry["result"] = result
@@ -926,36 +867,21 @@ def scan_loop():
 
             for symbol in group:
                 signal = signal_for_symbol(symbol)
+                if signal and should_send(signal):
+                    if signal["rank"] not in ["A+", "A"]:
+                        print(f"Skipping low-rank signal for {symbol}: {signal['rank']}", flush=True)
+                        continue
 
-                if not signal:
-                    continue
-
-                if signal["rank"] not in ["A+", "A"]:
-                    print(f"Skipping low-rank signal for {symbol}: {signal['rank']}", flush=True)
-                    continue
-
-                if not should_send(signal):
+                    log_signal(signal)
+                    message = build_message(signal)
                     print(
-                        f"Cooldown active for {symbol}: "
-                        f"{signal['setup']} {signal['direction']}",
+                        f"Sending signal for {symbol}: "
+                        f"{signal['setup']} | {signal['market_state']} | "
+                        f"{signal['direction']} | {signal['expiry']} | "
+                        f"{signal['confidence']}% | {signal['rank']}",
                         flush=True
                     )
-                    continue
-
-                message = build_message(signal)
-
-                print(
-                    f"Sending signal for {symbol}: "
-                    f"{signal['setup']} | {signal['market_state']} | "
-                    f"{signal['direction']} | {signal['expiry']} | "
-                    f"{signal['confidence']}% | {signal['rank']}",
-                    flush=True
-                )
-
-                sent = send_telegram(message)
-                if sent:
-                    mark_signal_sent(signal)
-                    log_signal(signal)
+                    send_telegram(message)
 
             time.sleep(SCAN_INTERVAL_SECONDS)
 
