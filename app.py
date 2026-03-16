@@ -13,7 +13,6 @@ TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# 12 pairs split into 3 groups
 PAIR_GROUPS = [
     ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD"],
     ["USD/CAD", "NZD/USD", "EUR/JPY", "GBP/JPY"],
@@ -22,13 +21,16 @@ PAIR_GROUPS = [
 
 LAST_SIGNAL = {}
 SCAN_INTERVAL_SECONDS = 60
-COOLDOWN_SECONDS = 1800  # 30 min same pair/setup/direction
+COOLDOWN_SECONDS = 1800
 NY_TZ = ZoneInfo("America/New_York")
 
 SIGNAL_LOG = []
 MAX_LOG_ITEMS = 1000
 PAIR_STATS = {}
 MAX_TELEGRAM_TEXT = 3900
+
+HTTP = requests.Session()
+HTTP.headers.update({"User-Agent": "SilentSurgeBot/Optimized"})
 
 
 # --------------------------
@@ -47,22 +49,30 @@ def iso_now():
 
 
 def parse_expiry_minutes(expiry_text: str) -> int:
-    if expiry_text.startswith("1"):
+    txt = (expiry_text or "").strip().lower()
+    if txt.startswith("1"):
         return 1
-    if expiry_text.startswith("2"):
+    if txt.startswith("2"):
         return 2
-    if expiry_text.startswith("5"):
+    if txt.startswith("5"):
         return 5
     return 3
+
+
+def parse_td_datetime(dt_str: str):
+    try:
+        return datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
 
 
 # --------------------------
 # Telegram
 # --------------------------
-def send_telegram(message: str) -> None:
+def send_telegram(message: str) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram env vars missing.", flush=True)
-        return
+        return False
 
     if len(message) > MAX_TELEGRAM_TEXT:
         message = message[:MAX_TELEGRAM_TEXT]
@@ -75,50 +85,93 @@ def send_telegram(message: str) -> None:
     }
 
     try:
-        requests.post(url, json=payload, timeout=15)
+        r = HTTP.post(url, json=payload, timeout=15)
+        if r.status_code != 200:
+            print(f"Telegram HTTP error {r.status_code}: {r.text}", flush=True)
+            return False
+        return True
     except Exception as e:
         print(f"Telegram error: {e}", flush=True)
+        return False
 
 
 # --------------------------
 # Data fetch
 # --------------------------
-def fetch_ohlc(symbol: str, interval: str, outputsize: int):
+def fetch_ohlc_1m(symbol: str, outputsize: int = 120):
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": symbol,
-        "interval": interval,
+        "interval": "1min",
         "outputsize": outputsize,
         "apikey": TWELVEDATA_API_KEY,
         "format": "JSON",
     }
 
     try:
-        r = requests.get(url, params=params, timeout=20)
+        r = HTTP.get(url, params=params, timeout=20)
         data = r.json()
     except Exception as e:
-        print(f"Fetch error for {symbol} {interval}: {e}", flush=True)
+        print(f"Fetch error for {symbol} 1min: {e}", flush=True)
         return None
 
     if "values" not in data:
-        print(f"Bad data for {symbol} {interval}: {data}", flush=True)
+        print(f"Bad data for {symbol} 1min: {data}", flush=True)
         return None
 
-    values = list(reversed(data["values"]))  # oldest -> newest
+    values = list(reversed(data["values"]))
     candles = []
+
     for v in values:
-        candles.append({
-            "datetime": v.get("datetime"),
-            "open": float(v["open"]),
-            "high": float(v["high"]),
-            "low": float(v["low"]),
-            "close": float(v["close"]),
-        })
-    return candles
+        try:
+            candles.append({
+                "datetime": v.get("datetime"),
+                "open": float(v["open"]),
+                "high": float(v["high"]),
+                "low": float(v["low"]),
+                "close": float(v["close"]),
+            })
+        except Exception:
+            continue
+
+    return candles if candles else None
+
+
+def build_5m_candles_from_1m(candles_1m):
+    if not candles_1m or len(candles_1m) < 5:
+        return None
+
+    buckets = {}
+
+    for c in candles_1m:
+        dt = parse_td_datetime(c["datetime"])
+        if dt is None:
+            continue
+
+        minute_floor = dt.minute - (dt.minute % 5)
+        bucket_dt = dt.replace(minute=minute_floor, second=0, microsecond=0)
+        key = bucket_dt.isoformat()
+
+        if key not in buckets:
+            buckets[key] = {
+                "datetime": bucket_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "open": c["open"],
+                "high": c["high"],
+                "low": c["low"],
+                "close": c["close"],
+            }
+        else:
+            buckets[key]["high"] = max(buckets[key]["high"], c["high"])
+            buckets[key]["low"] = min(buckets[key]["low"], c["low"])
+            buckets[key]["close"] = c["close"]
+
+    result = list(buckets.values())
+    result.sort(key=lambda x: x["datetime"])
+    return result
 
 
 def fetch_latest_price(symbol: str):
-    candles = fetch_ohlc(symbol, "1min", 2)
+    candles = fetch_ohlc_1m(symbol, 2)
     if not candles:
         return None
     return candles[-1]["close"]
@@ -257,22 +310,15 @@ def session_filter():
     weekday = now.weekday()
     hour = now.hour
 
-    # Saturday full closed
     if weekday == 5:
         return False, "Saturday"
 
-    # Sunday before forex open
     if weekday == 6 and hour < 17:
         return False, "Sunday pre-open"
 
-    # Friday after close
     if weekday == 4 and hour >= 17:
         return False, "Friday post-close"
 
-    # Session engine
-    # 19:00 - 23:59 NY -> Tokyo
-    # 00:00 - 11:59 NY -> Tokyo + London
-    # 12:00 - 16:59 NY -> New York
     if 19 <= hour <= 23:
         return True, "TOKYO"
 
@@ -286,7 +332,6 @@ def session_filter():
 
 
 def entry_timing_filter():
-    # kilitlemiyoruz; test ve live için açık
     return True
 
 
