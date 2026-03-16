@@ -257,24 +257,36 @@ def session_filter():
     weekday = now.weekday()
     hour = now.hour
 
+    # Saturday full closed
     if weekday == 5:
         return False, "Saturday"
 
+    # Sunday before forex open
     if weekday == 6 and hour < 17:
         return False, "Sunday pre-open"
 
+    # Friday after close
     if weekday == 4 and hour >= 17:
         return False, "Friday post-close"
 
-    # Tokyo/London geçişi dahil kalsın
-    if 3 <= hour < 16:
-        return True, "ACTIVE"
+    # Session engine
+    # 19:00 - 23:59 NY -> Tokyo
+    # 00:00 - 11:59 NY -> Tokyo + London
+    # 12:00 - 16:59 NY -> New York
+    if 19 <= hour <= 23:
+        return True, "TOKYO"
+
+    if 0 <= hour <= 11:
+        return True, "TOKYO_LONDON"
+
+    if 12 <= hour <= 16:
+        return True, "NEW_YORK"
 
     return False, "LOW_LIQUIDITY"
 
 
 def entry_timing_filter():
-    # Test/live hybrid mode: lock etmiyoruz
+    # kilitlemiyoruz; test ve live için açık
     return True
 
 
@@ -568,18 +580,14 @@ def check_exhaustion_reversal(symbol, closes_1m, closes_5m, atr_1m):
     if buy_trigger and trend_5m in ["UP", "FLAT"]:
         if trend_exhaustion_filter("BUY", closes_1m, rsi_1m):
             return None
-        return build_signal(
-            symbol, "EXHAUSTION_REVERSAL", "BUY", current, prev, rsi_1m,
-            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m
-        )
+        return build_signal(symbol, "EXHAUSTION_REVERSAL", "BUY", current, prev, rsi_1m,
+                            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m)
 
     if sell_trigger and trend_5m in ["DOWN", "FLAT"]:
         if trend_exhaustion_filter("SELL", closes_1m, rsi_1m):
             return None
-        return build_signal(
-            symbol, "EXHAUSTION_REVERSAL", "SELL", current, prev, rsi_1m,
-            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m
-        )
+        return build_signal(symbol, "EXHAUSTION_REVERSAL", "SELL", current, prev, rsi_1m,
+                            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m)
 
     return None
 
@@ -614,16 +622,12 @@ def check_breakout_retest(symbol, closes_1m, closes_5m, atr_1m):
     )
 
     if buy_trigger:
-        return build_signal(
-            symbol, "BREAKOUT_RETEST", "BUY", current, prev, rsi_1m,
-            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m
-        )
+        return build_signal(symbol, "BREAKOUT_RETEST", "BUY", current, prev, rsi_1m,
+                            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m)
 
     if sell_trigger:
-        return build_signal(
-            symbol, "BREAKOUT_RETEST", "SELL", current, prev, rsi_1m,
-            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m
-        )
+        return build_signal(symbol, "BREAKOUT_RETEST", "SELL", current, prev, rsi_1m,
+                            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m)
 
     return None
 
@@ -658,16 +662,12 @@ def check_momentum_pullback(symbol, closes_1m, closes_5m, atr_1m):
     )
 
     if buy_trigger:
-        return build_signal(
-            symbol, "MOMENTUM_PULLBACK", "BUY", current, prev, rsi_1m,
-            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m
-        )
+        return build_signal(symbol, "MOMENTUM_PULLBACK", "BUY", current, prev, rsi_1m,
+                            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m)
 
     if sell_trigger:
-        return build_signal(
-            symbol, "MOMENTUM_PULLBACK", "SELL", current, prev, rsi_1m,
-            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m
-        )
+        return build_signal(symbol, "MOMENTUM_PULLBACK", "SELL", current, prev, rsi_1m,
+                            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m)
 
     return None
 
@@ -758,9 +758,7 @@ def log_signal(signal):
         "bb_lower": signal["lower"],
         "signal_time_utc": signal["signal_time_utc"],
         "signal_time_ny": signal["signal_time_ny"],
-        "resolve_after_utc": (
-            utc_now() + timedelta(minutes=parse_expiry_minutes(signal["expiry"]))
-        ).isoformat(),
+        "resolve_after_utc": (utc_now() + timedelta(minutes=parse_expiry_minutes(signal["expiry"]))).isoformat(),
         "status": "OPEN",
         "result": None,
         "resolved_price": None,
@@ -863,7 +861,7 @@ def scan_loop():
             group_idx = minute % len(PAIR_GROUPS)
             group = PAIR_GROUPS[group_idx]
 
-            print(f"Scanning group: {group}", flush=True)
+            print(f"Scanning group: {group} | Session: {session_state}", flush=True)
 
             for symbol in group:
                 signal = signal_for_symbol(symbol)
