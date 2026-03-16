@@ -21,7 +21,7 @@ PAIR_GROUPS = [
 ]
 
 LAST_SIGNAL = {}
-SCAN_INTERVAL_SECONDS = 60
+SCAN_INTERVAL_SECONDS = 120
 COOLDOWN_SECONDS = 1800  # 30 min same pair/setup/direction
 NY_TZ = ZoneInfo("America/New_York")
 
