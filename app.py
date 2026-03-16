@@ -21,7 +21,7 @@ PAIR_GROUPS = [
 ]
 
 LAST_SIGNAL = {}
-SCAN_INTERVAL_SECONDS = 120
+SCAN_INTERVAL_SECONDS = 60
 COOLDOWN_SECONDS = 1800  # 30 min same pair/setup/direction
 NY_TZ = ZoneInfo("America/New_York")
 
@@ -29,6 +29,9 @@ SIGNAL_LOG = []
 MAX_LOG_ITEMS = 1000
 PAIR_STATS = {}
 MAX_TELEGRAM_TEXT = 3900
+
+HTTP = requests.Session()
+HTTP.headers.update({"User-Agent": "SilentSurgeBot/2.0"})
 
 
 # --------------------------
@@ -47,22 +50,34 @@ def iso_now():
 
 
 def parse_expiry_minutes(expiry_text: str) -> int:
-    if expiry_text.startswith("1"):
+    txt = (expiry_text or "").strip().lower()
+    if txt.startswith("1"):
         return 1
-    if expiry_text.startswith("2"):
+    if txt.startswith("2"):
         return 2
-    if expiry_text.startswith("5"):
+    if txt.startswith("5"):
         return 5
     return 3
+
+
+def parse_td_datetime(dt_str: str):
+    """
+    TwelveData datetime usually returns naive 'YYYY-MM-DD HH:MM:SS'.
+    We treat it as UTC for grouping consistency.
+    """
+    try:
+        return datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
 
 
 # --------------------------
 # Telegram
 # --------------------------
-def send_telegram(message: str) -> None:
+def send_telegram(message: str) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram env vars missing.", flush=True)
-        return
+        return False
 
     if len(message) > MAX_TELEGRAM_TEXT:
         message = message[:MAX_TELEGRAM_TEXT]
@@ -75,50 +90,101 @@ def send_telegram(message: str) -> None:
     }
 
     try:
-        requests.post(url, json=payload, timeout=15)
+        r = HTTP.post(url, json=payload, timeout=15)
+        if r.status_code != 200:
+            print(f"Telegram HTTP error {r.status_code}: {r.text}", flush=True)
+            return False
+        return True
     except Exception as e:
         print(f"Telegram error: {e}", flush=True)
+        return False
 
 
 # --------------------------
 # Data fetch
 # --------------------------
-def fetch_ohlc(symbol: str, interval: str, outputsize: int):
+def fetch_ohlc_1m(symbol: str, outputsize: int = 120):
+    if not TWELVEDATA_API_KEY:
+        print("TWELVEDATA_API_KEY missing.", flush=True)
+        return None
+
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": symbol,
-        "interval": interval,
+        "interval": "1min",
         "outputsize": outputsize,
         "apikey": TWELVEDATA_API_KEY,
         "format": "JSON",
     }
 
     try:
-        r = requests.get(url, params=params, timeout=20)
+        r = HTTP.get(url, params=params, timeout=20)
         data = r.json()
     except Exception as e:
-        print(f"Fetch error for {symbol} {interval}: {e}", flush=True)
+        print(f"Fetch error for {symbol} 1min: {e}", flush=True)
         return None
 
     if "values" not in data:
-        print(f"Bad data for {symbol} {interval}: {data}", flush=True)
+        print(f"Bad data for {symbol} 1min: {data}", flush=True)
         return None
 
     values = list(reversed(data["values"]))  # oldest -> newest
     candles = []
+
     for v in values:
-        candles.append({
-            "datetime": v.get("datetime"),
-            "open": float(v["open"]),
-            "high": float(v["high"]),
-            "low": float(v["low"]),
-            "close": float(v["close"]),
-        })
-    return candles
+        try:
+            candles.append({
+                "datetime": v.get("datetime"),
+                "open": float(v["open"]),
+                "high": float(v["high"]),
+                "low": float(v["low"]),
+                "close": float(v["close"]),
+            })
+        except Exception:
+            continue
+
+    return candles if candles else None
+
+
+def build_5m_candles_from_1m(candles_1m):
+    """
+    Aggregates 1-minute candles into 5-minute candles.
+    This keeps the 5m logic alive without making a second API request.
+    """
+    if not candles_1m or len(candles_1m) < 5:
+        return None
+
+    buckets = {}
+
+    for c in candles_1m:
+        dt = parse_td_datetime(c["datetime"])
+        if dt is None:
+            continue
+
+        minute_floor = dt.minute - (dt.minute % 5)
+        bucket_dt = dt.replace(minute=minute_floor, second=0, microsecond=0)
+        key = bucket_dt.isoformat()
+
+        if key not in buckets:
+            buckets[key] = {
+                "datetime": bucket_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "open": c["open"],
+                "high": c["high"],
+                "low": c["low"],
+                "close": c["close"],
+            }
+        else:
+            buckets[key]["high"] = max(buckets[key]["high"], c["high"])
+            buckets[key]["low"] = min(buckets[key]["low"], c["low"])
+            buckets[key]["close"] = c["close"]
+
+    result = list(buckets.values())
+    result.sort(key=lambda x: x["datetime"])
+    return result if len(result) >= 20 else result
 
 
 def fetch_latest_price(symbol: str):
-    candles = fetch_ohlc(symbol, "1min", 2)
+    candles = fetch_ohlc_1m(symbol, 2)
     if not candles:
         return None
     return candles[-1]["close"]
@@ -253,12 +319,11 @@ def detect_market_regime(price, upper, mid, lower, rsi_1m, atr_1m):
 
 
 def session_filter():
-    # Always active for testing / full-time scanning
+    # Always active
     return True, "ACTIVE"
 
 
 def entry_timing_filter():
-    # Test mode: do not block signals by second timing
     return True
 
 
@@ -660,10 +725,12 @@ def check_momentum_pullback(symbol, closes_1m, closes_5m, atr_1m):
 # Engine
 # --------------------------
 def signal_for_symbol(symbol):
-    candles_1m = fetch_ohlc(symbol, "1min", 100)
-    candles_5m = fetch_ohlc(symbol, "5min", 50)
+    candles_1m = fetch_ohlc_1m(symbol, 120)
+    if not candles_1m or len(candles_1m) < 30:
+        return None
 
-    if not candles_1m or len(candles_1m) < 25 or not candles_5m:
+    candles_5m = build_5m_candles_from_1m(candles_1m)
+    if not candles_5m or len(candles_5m) < 20:
         return None
 
     closes_1m = closes_from_ohlc(candles_1m)
@@ -712,12 +779,12 @@ def should_send(signal):
     key = f"{signal['symbol']}:{signal['direction']}:{signal['setup']}"
     now_ts = time.time()
     last_time = LAST_SIGNAL.get(key, 0)
+    return (now_ts - last_time) >= COOLDOWN_SECONDS
 
-    if now_ts - last_time < COOLDOWN_SECONDS:
-        return False
 
-    LAST_SIGNAL[key] = now_ts
-    return True
+def mark_signal_sent(signal):
+    key = f"{signal['symbol']}:{signal['direction']}:{signal['setup']}"
+    LAST_SIGNAL[key] = time.time()
 
 
 def log_signal(signal):
@@ -859,21 +926,36 @@ def scan_loop():
 
             for symbol in group:
                 signal = signal_for_symbol(symbol)
-                if signal and should_send(signal):
-                    if signal["rank"] not in ["A+", "A"]:
-                        print(f"Skipping low-rank signal for {symbol}: {signal['rank']}", flush=True)
-                        continue
 
-                    log_signal(signal)
-                    message = build_message(signal)
+                if not signal:
+                    continue
+
+                if signal["rank"] not in ["A+", "A"]:
+                    print(f"Skipping low-rank signal for {symbol}: {signal['rank']}", flush=True)
+                    continue
+
+                if not should_send(signal):
                     print(
-                        f"Sending signal for {symbol}: "
-                        f"{signal['setup']} | {signal['market_state']} | "
-                        f"{signal['direction']} | {signal['expiry']} | "
-                        f"{signal['confidence']}% | {signal['rank']}",
+                        f"Cooldown active for {symbol}: "
+                        f"{signal['setup']} {signal['direction']}",
                         flush=True
                     )
-                    send_telegram(message)
+                    continue
+
+                message = build_message(signal)
+
+                print(
+                    f"Sending signal for {symbol}: "
+                    f"{signal['setup']} | {signal['market_state']} | "
+                    f"{signal['direction']} | {signal['expiry']} | "
+                    f"{signal['confidence']}% | {signal['rank']}",
+                    flush=True
+                )
+
+                sent = send_telegram(message)
+                if sent:
+                    mark_signal_sent(signal)
+                    log_signal(signal)
 
             time.sleep(SCAN_INTERVAL_SECONDS)
 
