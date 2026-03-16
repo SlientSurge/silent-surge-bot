@@ -13,7 +13,7 @@ TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# 12 pairs split into 3 groups to stay within free API limits
+# 12 pairs split into 3 groups
 PAIR_GROUPS = [
     ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD"],
     ["USD/CAD", "NZD/USD", "EUR/JPY", "GBP/JPY"],
@@ -61,7 +61,7 @@ def parse_expiry_minutes(expiry_text: str) -> int:
 # --------------------------
 def send_telegram(message: str) -> None:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram env vars missing.")
+        print("Telegram env vars missing.", flush=True)
         return
 
     if len(message) > MAX_TELEGRAM_TEXT:
@@ -77,7 +77,7 @@ def send_telegram(message: str) -> None:
     try:
         requests.post(url, json=payload, timeout=15)
     except Exception as e:
-        print(f"Telegram error: {e}")
+        print(f"Telegram error: {e}", flush=True)
 
 
 # --------------------------
@@ -97,11 +97,11 @@ def fetch_ohlc(symbol: str, interval: str, outputsize: int):
         r = requests.get(url, params=params, timeout=20)
         data = r.json()
     except Exception as e:
-        print(f"Fetch error for {symbol} {interval}: {e}")
+        print(f"Fetch error for {symbol} {interval}: {e}", flush=True)
         return None
 
     if "values" not in data:
-        print(f"Bad data for {symbol} {interval}: {data}")
+        print(f"Bad data for {symbol} {interval}: {data}", flush=True)
         return None
 
     values = list(reversed(data["values"]))  # oldest -> newest
@@ -237,13 +237,13 @@ def detect_market_regime(price, upper, mid, lower, rsi_1m, atr_1m):
     rel_band = band_width / max(price, 1e-9)
     rel_atr = atr_1m / max(price, 1e-9)
 
-    if rel_atr < 0.00025:
+    if rel_atr < 0.00020:
         return "DEAD"
 
-    if rel_atr > 0.0012:
+    if rel_atr > 0.0015:
         return "EXPLOSIVE"
 
-    if rel_band < 0.0009:
+    if rel_band < 0.0007:
         return "RANGE"
 
     if rsi_1m >= 58 or rsi_1m <= 42:
@@ -273,16 +273,15 @@ def session_filter():
 
 
 def entry_timing_filter():
-    # Only take entries near the start of a new minute
-    sec = utc_now().second
-    return sec <= 15
+    # Test mode: do not block signals by second timing
+    return True
 
 
 def atr_filter(atr_1m, price):
     if atr_1m is None or price <= 0:
         return False
     rel_atr = atr_1m / price
-    return rel_atr >= 0.00035
+    return rel_atr >= 0.00020
 
 
 def expansion_filter(candles_1m, atr_1m):
@@ -293,10 +292,10 @@ def expansion_filter(candles_1m, atr_1m):
     prev_ranges = [candle_range(c) for c in candles_1m[-5:-1]]
     avg_prev_range = sum(prev_ranges) / len(prev_ranges) if prev_ranges else 0
 
-    if last_range < atr_1m * 0.65:
+    if last_range < atr_1m * 0.40:
         return False
 
-    if avg_prev_range > 0 and last_range < avg_prev_range * 0.9:
+    if avg_prev_range > 0 and last_range < avg_prev_range * 0.70:
         return False
 
     return True
@@ -309,11 +308,11 @@ def trend_exhaustion_filter(direction, closes_1m, rsi_1m):
     c2, c3, c4 = closes_1m[-3], closes_1m[-2], closes_1m[-1]
 
     if direction == "BUY":
-        if c4 < c3 < c2 and rsi_1m < 28:
+        if c4 < c3 < c2 and rsi_1m < 25:
             return True
 
     if direction == "SELL":
-        if c4 > c3 > c2 and rsi_1m > 72:
+        if c4 > c3 > c2 and rsi_1m > 75:
             return True
 
     return False
@@ -323,24 +322,19 @@ def hard_no_trade_filter(price, regime, rsi_1m, atr_1m, sma_fast, sma_slow, uppe
     if None in (price, rsi_1m, atr_1m, sma_fast, sma_slow, upper, lower):
         return True
 
-    # dead market
     if regime == "DEAD":
         return True
 
-    # too explosive -> avoid random spike trades
     if regime == "EXPLOSIVE":
         return True
 
-    # band too tight
-    if (upper - lower) < price * 0.0008:
+    if (upper - lower) < price * 0.0005:
         return True
 
-    # indecisive RSI
-    if 45 < rsi_1m < 55:
+    if 48 < rsi_1m < 52:
         return True
 
-    # flat averages
-    if abs(sma_fast - sma_slow) < price * 0.0001:
+    if abs(sma_fast - sma_slow) < price * 0.00005:
         return True
 
     return False
@@ -414,12 +408,13 @@ def expiry_from_market_state(market_state):
 # --------------------------
 # Scoring / ranking
 # --------------------------
-def get_confidence_quality_rank(direction, current, prev, upper, lower,
-                                rsi_1m, sma_fast, sma_slow,
-                                trend_5m, atr_1m, setup_type, market_state):
+def get_confidence_quality_rank(
+    direction, current, prev, upper, lower,
+    rsi_1m, sma_fast, sma_slow,
+    trend_5m, atr_1m, setup_type, market_state
+):
     confidence = 50
 
-    # base by setup
     if setup_type == "EXHAUSTION_REVERSAL":
         confidence += 6
     elif setup_type == "BREAKOUT_RETEST":
@@ -427,7 +422,6 @@ def get_confidence_quality_rank(direction, current, prev, upper, lower,
     elif setup_type == "MOMENTUM_PULLBACK":
         confidence += 8
 
-    # market state bonus
     if market_state == "STRONG_TREND":
         confidence += 8
     elif market_state == "REVERSAL":
@@ -575,14 +569,18 @@ def check_exhaustion_reversal(symbol, closes_1m, closes_5m, atr_1m):
     if buy_trigger and trend_5m in ["UP", "FLAT"]:
         if trend_exhaustion_filter("BUY", closes_1m, rsi_1m):
             return None
-        return build_signal(symbol, "EXHAUSTION_REVERSAL", "BUY", current, prev, rsi_1m,
-                            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m)
+        return build_signal(
+            symbol, "EXHAUSTION_REVERSAL", "BUY", current, prev, rsi_1m,
+            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m
+        )
 
     if sell_trigger and trend_5m in ["DOWN", "FLAT"]:
         if trend_exhaustion_filter("SELL", closes_1m, rsi_1m):
             return None
-        return build_signal(symbol, "EXHAUSTION_REVERSAL", "SELL", current, prev, rsi_1m,
-                            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m)
+        return build_signal(
+            symbol, "EXHAUSTION_REVERSAL", "SELL", current, prev, rsi_1m,
+            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m
+        )
 
     return None
 
@@ -617,12 +615,16 @@ def check_breakout_retest(symbol, closes_1m, closes_5m, atr_1m):
     )
 
     if buy_trigger:
-        return build_signal(symbol, "BREAKOUT_RETEST", "BUY", current, prev, rsi_1m,
-                            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m)
+        return build_signal(
+            symbol, "BREAKOUT_RETEST", "BUY", current, prev, rsi_1m,
+            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m
+        )
 
     if sell_trigger:
-        return build_signal(symbol, "BREAKOUT_RETEST", "SELL", current, prev, rsi_1m,
-                            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m)
+        return build_signal(
+            symbol, "BREAKOUT_RETEST", "SELL", current, prev, rsi_1m,
+            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m
+        )
 
     return None
 
@@ -655,12 +657,16 @@ def check_momentum_pullback(symbol, closes_1m, closes_5m, atr_1m):
     )
 
     if buy_trigger:
-        return build_signal(symbol, "MOMENTUM_PULLBACK", "BUY", current, prev, rsi_1m,
-                            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m)
+        return build_signal(
+            symbol, "MOMENTUM_PULLBACK", "BUY", current, prev, rsi_1m,
+            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m
+        )
 
     if sell_trigger:
-        return build_signal(symbol, "MOMENTUM_PULLBACK", "SELL", current, prev, rsi_1m,
-                            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m)
+        return build_signal(
+            symbol, "MOMENTUM_PULLBACK", "SELL", current, prev, rsi_1m,
+            upper, mid, lower, atr_1m, sma_fast, sma_slow, trend_5m
+        )
 
     return None
 
@@ -751,7 +757,9 @@ def log_signal(signal):
         "bb_lower": signal["lower"],
         "signal_time_utc": signal["signal_time_utc"],
         "signal_time_ny": signal["signal_time_ny"],
-        "resolve_after_utc": (utc_now() + timedelta(minutes=parse_expiry_minutes(signal["expiry"]))).isoformat(),
+        "resolve_after_utc": (
+            utc_now() + timedelta(minutes=parse_expiry_minutes(signal["expiry"]))
+        ).isoformat(),
         "status": "OPEN",
         "result": None,
         "resolved_price": None,
@@ -784,9 +792,17 @@ def resolve_signal_results():
                 direction = entry["direction"]
 
                 if direction == "BUY":
-                    result = "WIN" if latest_price > entry_price else "LOSS" if latest_price < entry_price else "DRAW"
+                    result = (
+                        "WIN" if latest_price > entry_price
+                        else "LOSS" if latest_price < entry_price
+                        else "DRAW"
+                    )
                 else:
-                    result = "WIN" if latest_price < entry_price else "LOSS" if latest_price > entry_price else "DRAW"
+                    result = (
+                        "WIN" if latest_price < entry_price
+                        else "LOSS" if latest_price > entry_price
+                        else "DRAW"
+                    )
 
                 entry["status"] = "CLOSED"
                 entry["result"] = result
@@ -796,13 +812,14 @@ def resolve_signal_results():
                 update_pair_stats(entry["pair"], result)
                 print(
                     f"Resolved {entry['pair']} | {entry['setup']} | "
-                    f"{entry['direction']} | {entry['expiry']} => {result}"
+                    f"{entry['direction']} | {entry['expiry']} => {result}",
+                    flush=True
                 )
 
             time.sleep(20)
 
         except Exception as e:
-            print(f"Resolver loop error: {e}")
+            print(f"Resolver loop error: {e}", flush=True)
             time.sleep(20)
 
 
@@ -834,17 +851,18 @@ def build_message(signal):
 # --------------------------
 def scan_loop():
     time.sleep(10)
+    print("Scanner thread started", flush=True)
 
     while True:
         try:
             can_trade, session_state = session_filter()
             if not can_trade:
-                print(f"Session blocked: {session_state}")
+                print(f"Session blocked: {session_state}", flush=True)
                 time.sleep(SCAN_INTERVAL_SECONDS)
                 continue
 
             if not entry_timing_filter():
-                print("Entry timing blocked")
+                print("Entry timing blocked", flush=True)
                 time.sleep(5)
                 continue
 
@@ -852,13 +870,13 @@ def scan_loop():
             group_idx = minute % len(PAIR_GROUPS)
             group = PAIR_GROUPS[group_idx]
 
-            print(f"Scanning group: {group}")
+            print(f"Scanning group: {group}", flush=True)
 
             for symbol in group:
                 signal = signal_for_symbol(symbol)
                 if signal and should_send(signal):
                     if signal["rank"] not in ["A+", "A"]:
-                        print(f"Skipping low-rank signal for {symbol}: {signal['rank']}")
+                        print(f"Skipping low-rank signal for {symbol}: {signal['rank']}", flush=True)
                         continue
 
                     log_signal(signal)
@@ -867,14 +885,15 @@ def scan_loop():
                         f"Sending signal for {symbol}: "
                         f"{signal['setup']} | {signal['market_state']} | "
                         f"{signal['direction']} | {signal['expiry']} | "
-                        f"{signal['confidence']}% | {signal['rank']}"
+                        f"{signal['confidence']}% | {signal['rank']}",
+                        flush=True
                     )
                     send_telegram(message)
 
             time.sleep(SCAN_INTERVAL_SECONDS)
 
         except Exception as e:
-            print(f"Scanner loop error: {e}")
+            print(f"Scanner loop error: {e}", flush=True)
             time.sleep(30)
 
 
