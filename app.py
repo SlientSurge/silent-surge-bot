@@ -23,16 +23,14 @@ PORT = int(os.environ.get("PORT", "10000"))
 NY_TZ = ZoneInfo("America/New_York")
 
 # =========================
-# BOT SETTINGS
+# BOT SETTINGS (FREE PLAN OPTIMIZED)
 # =========================
 PAIR_GROUPS = [
-    ["EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD"],
-    ["USD/CAD", "NZD/USD", "EUR/JPY", "GBP/JPY"],
-    ["AUD/JPY", "CAD/JPY", "EUR/GBP", "GBP/CHF"],
+    ["EUR/USD", "GBP/USD", "USD/JPY"],
 ]
 
-SCAN_INTERVAL_SECONDS = 60
-COOLDOWN_SECONDS = 1800
+SCAN_INTERVAL_SECONDS = 300   # 5 dakikada 1 tarama
+COOLDOWN_SECONDS = 1800       # aynı paritede 30 dk tekrar sinyal verme
 REQUEST_TIMEOUT = 20
 
 LAST_SIGNAL = {}
@@ -134,10 +132,8 @@ def get_session_name(hour_ny: int):
         return "LOW LIQUIDITY"
 
 def get_active_pairs_for_session(session_name):
-    minute_bucket = now_ny().minute // 20
-    group_index = minute_bucket % len(PAIR_GROUPS)
-    LATEST_STATUS["last_group"] = group_index + 1
-    return PAIR_GROUPS[group_index]
+    LATEST_STATUS["last_group"] = 1
+    return PAIR_GROUPS[0]
 
 def symbol_to_twelvedata(symbol):
     return symbol.strip()
@@ -145,7 +141,7 @@ def symbol_to_twelvedata(symbol):
 # =========================
 # MARKET DATA
 # =========================
-def fetch_twelvedata_candles(symbol, interval="5min", outputsize=120):
+def fetch_twelvedata_candles(symbol, interval="5min", outputsize=70):
     if not TWELVEDATA_API_KEY:
         raise RuntimeError("TWELVEDATA_API_KEY eksik")
 
@@ -278,8 +274,8 @@ def bollinger_bands(values, period=20, std_multiplier=2.0):
 # SIGNAL ENGINE
 # =========================
 def analyze_symbol(symbol):
-    candles = fetch_twelvedata_candles(symbol, interval="5min", outputsize=120)
-    if len(candles) < 60:
+    candles = fetch_twelvedata_candles(symbol, interval="5min", outputsize=70)
+    if len(candles) < 40:
         raise RuntimeError(f"Yetersiz veri: {symbol}")
 
     closes = [c["close"] for c in candles]
