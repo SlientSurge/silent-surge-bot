@@ -646,3 +646,10 @@ if __name__ == "__main__":
     startup_message()
     start_background_scanner()
     app.run(host="0.0.0.0", port=PORT)
+    
+def start_background_scan():
+    t = threading.Thread(target=scan_loop)
+    t.daemon = True
+    t.start()
+
+start_background_scan()
