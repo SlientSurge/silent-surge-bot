@@ -152,7 +152,7 @@ def get_active_pairs_for_session(session_name):
     return PAIR_GROUPS[group_index]
 
 def symbol_to_twelvedata(symbol):
-    return symbol.replace("/", "")
+    return symbol
 
 # =========================
 # MARKET DATA
