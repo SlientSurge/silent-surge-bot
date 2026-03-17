@@ -4,7 +4,7 @@ import os
 import time
 import threading
 import math
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
@@ -152,7 +152,8 @@ def get_active_pairs_for_session(session_name):
     return PAIR_GROUPS[group_index]
 
 def symbol_to_twelvedata(symbol):
-    return symbol
+    # TwelveData forex sembollerini slash ile bekliyor: EUR/USD, GBP/JPY vb.
+    return symbol.strip()
 
 # =========================
 # MARKET DATA
@@ -175,12 +176,19 @@ def fetch_twelvedata_candles(symbol, interval="5min", outputsize=120):
     }
 
     r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-    data = r.json()
 
-    if "status" in data and data["status"] == "error":
+    try:
+        data = r.json()
+    except Exception:
+        raise RuntimeError(f"TwelveData JSON parse hatası: HTTP {r.status_code} - {r.text[:500]}")
+
+    if r.status_code != 200:
+        raise RuntimeError(f"TwelveData HTTP error for {symbol}: {r.status_code} - {data}")
+
+    if isinstance(data, dict) and data.get("status") == "error":
         raise RuntimeError(f"TwelveData error for {symbol}: {data.get('message')}")
 
-    if "values" not in data:
+    if "values" not in data or not data.get("values"):
         raise RuntimeError(f"TwelveData values yok: {symbol} -> {data}")
 
     values = list(reversed(data["values"]))  # eski -> yeni
@@ -195,6 +203,10 @@ def fetch_twelvedata_candles(symbol, interval="5min", outputsize=120):
         })
 
     candles = [c for c in candles if None not in (c["open"], c["high"], c["low"], c["close"])]
+
+    if not candles:
+        raise RuntimeError(f"TwelveData geçerli candle dönmedi: {symbol}")
+
     return candles
 
 # =========================
