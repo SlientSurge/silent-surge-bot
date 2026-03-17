@@ -32,10 +32,10 @@ PAIR_GROUPS = [
 ]
 
 SCAN_INTERVAL_SECONDS = 60
-COOLDOWN_SECONDS = 1800  # aynı paritede 30 dk tekrar sinyal verme
+COOLDOWN_SECONDS = 1800
 REQUEST_TIMEOUT = 20
 
-LAST_SIGNAL = {}         # {symbol: {"direction": "...", "time": epoch}}
+LAST_SIGNAL = {}
 LATEST_STATUS = {
     "last_scan_ny": None,
     "last_scan_utc": None,
@@ -45,6 +45,8 @@ LATEST_STATUS = {
     "last_signal": None,
     "signals_sent_today": 0,
     "bot_started_ny": None,
+    "scanner_started": False,
+    "scanner_heartbeat": None,
 }
 
 # =========================
@@ -56,10 +58,8 @@ RSI_PERIOD = 14
 BB_PERIOD = 20
 BB_STDDEV = 2.0
 
-# Sinyal eşiği — çok katı değil, tamamen gevşek de değil
 MIN_CONFIDENCE = 72
 
-# Session bazlı minimum confidence
 SESSION_MIN_CONFIDENCE = {
     "TOKYO": 76,
     "TOKYO + LONDON": 73,
@@ -104,7 +104,7 @@ def stddev(values):
 
 def send_telegram_message(text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[WARN] Telegram env eksik. Mesaj gönderilemedi.")
+        print("[WARN] Telegram env eksik. Mesaj gönderilemedi.", flush=True)
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -112,25 +112,18 @@ def send_telegram_message(text):
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text
     }
+
     try:
         r = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
         if r.status_code == 200:
             return True
-        print(f"[ERROR] Telegram gönderilemedi: {r.status_code} - {r.text}")
+        print(f"[ERROR] Telegram gönderilemedi: {r.status_code} - {r.text}", flush=True)
         return False
     except Exception as e:
-        print(f"[ERROR] Telegram exception: {e}")
+        print(f"[ERROR] Telegram exception: {e}", flush=True)
         return False
 
 def get_session_name(hour_ny: int):
-    """
-    New York saatine göre session belirleme.
-    Kullanıcının özellikle istediği mantığa yakın kuruldu:
-      19:00 – 23:59  Tokyo
-      00:00 – 11:00  Tokyo + London
-      12:00 – 16:00  NY
-      Diğerleri       Low Liquidity
-    """
     if 19 <= hour_ny <= 23:
         return "TOKYO"
     elif 0 <= hour_ny <= 11:
@@ -141,27 +134,18 @@ def get_session_name(hour_ny: int):
         return "LOW LIQUIDITY"
 
 def get_active_pairs_for_session(session_name):
-    """
-    Session'a göre grup dönüşümlü çalışır.
-    Burada tüm grup sistemi korunuyor; hangi saatteysek ona göre
-    tarama grubu seçiyoruz ki aynı anda her şeyi boğmayalım.
-    """
-    minute_bucket = now_ny().minute // 20  # 0,1,2
+    minute_bucket = now_ny().minute // 20
     group_index = minute_bucket % len(PAIR_GROUPS)
     LATEST_STATUS["last_group"] = group_index + 1
     return PAIR_GROUPS[group_index]
 
 def symbol_to_twelvedata(symbol):
-    # TwelveData forex sembollerini slash ile bekliyor: EUR/USD, GBP/JPY vb.
     return symbol.strip()
 
 # =========================
 # MARKET DATA
 # =========================
 def fetch_twelvedata_candles(symbol, interval="5min", outputsize=120):
-    """
-    TwelveData time_series endpoint
-    """
     if not TWELVEDATA_API_KEY:
         raise RuntimeError("TWELVEDATA_API_KEY eksik")
 
@@ -175,6 +159,7 @@ def fetch_twelvedata_candles(symbol, interval="5min", outputsize=120):
         "format": "JSON"
     }
 
+    print(f"[FETCH] Requesting TwelveData for {symbol} ({interval}, {outputsize})", flush=True)
     r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
 
     try:
@@ -191,7 +176,7 @@ def fetch_twelvedata_candles(symbol, interval="5min", outputsize=120):
     if "values" not in data or not data.get("values"):
         raise RuntimeError(f"TwelveData values yok: {symbol} -> {data}")
 
-    values = list(reversed(data["values"]))  # eski -> yeni
+    values = list(reversed(data["values"]))
     candles = []
     for row in values:
         candles.append({
@@ -207,6 +192,7 @@ def fetch_twelvedata_candles(symbol, interval="5min", outputsize=120):
     if not candles:
         raise RuntimeError(f"TwelveData geçerli candle dönmedi: {symbol}")
 
+    print(f"[FETCH OK] {symbol} candles: {len(candles)}", flush=True)
     return candles
 
 # =========================
@@ -320,26 +306,21 @@ def analyze_symbol(symbol):
     bb_l = bb_lower[i]
     bb_m = bb_mid[i]
 
-    # Mum karakteri
     candle_body = abs(closes[i] - opens[i])
     candle_range = highs[i] - lows[i] if highs[i] - lows[i] != 0 else 1e-9
     upper_wick = highs[i] - max(opens[i], closes[i])
     lower_wick = min(opens[i], closes[i]) - lows[i]
     body_ratio = candle_body / candle_range
 
-    # Trend
     uptrend = ema_fast_now > ema_slow_now and close > ema_fast_now
     downtrend = ema_fast_now < ema_slow_now and close < ema_fast_now
 
-    # Momentum
     rsi_rising = current_rsi > prev_rsi
     rsi_falling = current_rsi < prev_rsi
 
-    # Band konumu
     near_upper = close >= (bb_u - (abs(bb_u - bb_l) * 0.10))
     near_lower = close <= (bb_l + (abs(bb_u - bb_l) * 0.10))
 
-    # Basit yorgunluk işaretleri
     small_body = body_ratio < 0.35
     upper_rejection = upper_wick > candle_body * 1.2
     lower_rejection = lower_wick > candle_body * 1.2
@@ -348,7 +329,6 @@ def analyze_symbol(symbol):
     confidence = 0
     reason_parts = []
 
-    # BUY setup
     if uptrend and rsi_rising:
         confidence += 30
         reason_parts.append("trend up")
@@ -372,7 +352,6 @@ def analyze_symbol(symbol):
 
         direction = "UP"
 
-    # SELL setup
     elif downtrend and rsi_falling:
         confidence += 30
         reason_parts.append("trend down")
@@ -408,7 +387,6 @@ def analyze_symbol(symbol):
             "ema_slow": round(ema_slow_now, 5),
         }
 
-    # RSI aşırı bölge yorgunluk filtresi
     if direction == "UP" and current_rsi > 72:
         confidence -= 10
         reason_parts.append("RSI too hot")
@@ -416,7 +394,6 @@ def analyze_symbol(symbol):
         confidence -= 10
         reason_parts.append("RSI too stretched")
 
-    # Orta banda çok yakınsa kararsız say
     band_width = abs(bb_u - bb_l)
     if band_width > 0:
         dist_to_mid = abs(close - bb_m)
@@ -443,9 +420,7 @@ def is_on_cooldown(symbol, direction):
         return False
 
     elapsed = time.time() - data["time"]
-    if elapsed < COOLDOWN_SECONDS and data["direction"] == direction:
-        return True
-    return False
+    return elapsed < COOLDOWN_SECONDS and data["direction"] == direction
 
 def mark_signal(symbol, direction):
     LAST_SIGNAL[symbol] = {
@@ -457,7 +432,7 @@ def build_signal_message(result, session_name):
     arrow = "⬆️" if result["signal"] == "UP" else "⬇️"
     direction_tr = "YUKARI" if result["signal"] == "UP" else "AŞAĞI"
 
-    text = (
+    return (
         f"🚨 SİNYAL\n"
         f"Parite: {result['symbol']}\n"
         f"Yön: {arrow} {direction_tr}\n"
@@ -470,7 +445,6 @@ def build_signal_message(result, session_name):
         f"Neden: {result['reason']}\n"
         f"Saat: {fmt_ny()}"
     )
-    return text
 
 # =========================
 # SCAN LOOP
@@ -478,31 +452,32 @@ def build_signal_message(result, session_name):
 def scan_market_once():
     ny = now_ny()
     utc = now_utc()
-    hour_ny = ny.hour
-    session_name = get_session_name(hour_ny)
+    session_name = get_session_name(ny.hour)
 
     LATEST_STATUS["last_scan_ny"] = fmt_ny(ny)
     LATEST_STATUS["last_scan_utc"] = utc.strftime("%Y-%m-%d %H:%M:%S UTC")
     LATEST_STATUS["last_session"] = session_name
     LATEST_STATUS["last_error"] = None
+    LATEST_STATUS["scanner_heartbeat"] = fmt_ny(ny)
 
     pairs = get_active_pairs_for_session(session_name)
     min_conf = SESSION_MIN_CONFIDENCE.get(session_name, MIN_CONFIDENCE)
 
-    print("=" * 80)
-    print(f"[SCAN] NY TIME: {fmt_ny(ny)}")
-    print(f"[SCAN] UTC TIME: {utc.strftime('%Y-%m-%d %H:%M:%S UTC')}")
-    print(f"[SCAN] SESSION: {session_name}")
-    print(f"[SCAN] GROUP: {LATEST_STATUS['last_group']}")
-    print(f"[SCAN] PAIRS: {pairs}")
-    print(f"[SCAN] MIN CONFIDENCE: {min_conf}")
+    print("=" * 80, flush=True)
+    print(f"[SCAN] NY TIME: {fmt_ny(ny)}", flush=True)
+    print(f"[SCAN] UTC TIME: {utc.strftime('%Y-%m-%d %H:%M:%S UTC')}", flush=True)
+    print(f"[SCAN] SESSION: {session_name}", flush=True)
+    print(f"[SCAN] GROUP: {LATEST_STATUS['last_group']}", flush=True)
+    print(f"[SCAN] PAIRS: {pairs}", flush=True)
+    print(f"[SCAN] MIN CONFIDENCE: {min_conf}", flush=True)
 
     best_result = None
 
     for symbol in pairs:
         try:
+            print(f"[CHECK] Starting analysis for {symbol}", flush=True)
             result = analyze_symbol(symbol)
-            print(f"[{symbol}] -> {result}")
+            print(f"[RESULT] {symbol} -> {result}", flush=True)
 
             if result["signal"] is None:
                 continue
@@ -511,14 +486,14 @@ def scan_market_once():
                 continue
 
             if is_on_cooldown(symbol, result["signal"]):
-                print(f"[{symbol}] cooldown aktif, tekrar gönderilmeyecek.")
+                print(f"[COOLDOWN] {symbol} cooldown aktif, tekrar gönderilmeyecek.", flush=True)
                 continue
 
             if (best_result is None) or (result["confidence"] > best_result["confidence"]):
                 best_result = result
 
         except Exception as e:
-            print(f"[ERROR] {symbol}: {e}")
+            print(f"[ERROR] {symbol}: {e}", flush=True)
 
     if best_result:
         msg = build_signal_message(best_result, session_name)
@@ -533,20 +508,22 @@ def scan_market_once():
                 "session": session_name,
             }
             LATEST_STATUS["signals_sent_today"] += 1
-            print(f"[SENT] {best_result['symbol']} {best_result['signal']} %{best_result['confidence']}")
+            print(f"[SENT] {best_result['symbol']} {best_result['signal']} %{best_result['confidence']}", flush=True)
         else:
-            print("[WARN] Signal bulundu ama Telegram gönderimi başarısız.")
+            print("[WARN] Signal bulundu ama Telegram gönderimi başarısız.", flush=True)
     else:
-        print("[SCAN] Uygun sinyal bulunamadı.")
+        print("[SCAN] Uygun sinyal bulunamadı.", flush=True)
 
 def scan_loop():
+    print("[SCANNER] Background scanner thread started.", flush=True)
     while True:
         try:
             scan_market_once()
         except Exception as e:
             LATEST_STATUS["last_error"] = str(e)
-            print(f"[FATAL SCAN ERROR] {e}")
+            print(f"[FATAL SCAN ERROR] {e}", flush=True)
 
+        print(f"[SCANNER] Sleeping {SCAN_INTERVAL_SECONDS}s before next scan...", flush=True)
         time.sleep(SCAN_INTERVAL_SECONDS)
 
 # =========================
@@ -567,6 +544,8 @@ def home():
         "last_signal": LATEST_STATUS["last_signal"],
         "last_error": LATEST_STATUS["last_error"],
         "group": LATEST_STATUS["last_group"],
+        "scanner_started": LATEST_STATUS["scanner_started"],
+        "scanner_heartbeat": LATEST_STATUS["scanner_heartbeat"],
     })
 
 @app.route("/health", methods=["GET"])
@@ -581,6 +560,8 @@ def health():
         "last_error": LATEST_STATUS["last_error"],
         "last_signal": LATEST_STATUS["last_signal"],
         "signals_sent_today": LATEST_STATUS["signals_sent_today"],
+        "scanner_started": LATEST_STATUS["scanner_started"],
+        "scanner_heartbeat": LATEST_STATUS["scanner_heartbeat"],
         "env": {
             "TWELVEDATA_API_KEY_SET": bool(TWELVEDATA_API_KEY),
             "TELEGRAM_TOKEN_SET": bool(TELEGRAM_TOKEN),
@@ -628,28 +609,27 @@ def startup_message():
     send_telegram_message(text)
 
 def start_background_scanner():
-    t = threading.Thread(target=scan_loop, daemon=True)
+    if LATEST_STATUS["scanner_started"]:
+        print("[SCANNER] Scanner zaten başlatılmış, ikinci kez başlatılmayacak.", flush=True)
+        return
+
+    t = threading.Thread(target=scan_loop, daemon=True, name="market-scanner")
     t.start()
+    LATEST_STATUS["scanner_started"] = True
+    print(f"[SCANNER] Thread started: {t.name}", flush=True)
 
 if __name__ == "__main__":
     LATEST_STATUS["bot_started_ny"] = fmt_ny()
-    print("=" * 80)
-    print("[BOOT] Bot starting...")
-    print(f"[BOOT] NY TIME: {fmt_ny()}")
-    print(f"[BOOT] Session: {get_session_name(now_ny().hour)}")
-    print(f"[BOOT] PORT: {PORT}")
-    print(f"[BOOT] TWELVEDATA_API_KEY_SET: {bool(TWELVEDATA_API_KEY)}")
-    print(f"[BOOT] TELEGRAM_TOKEN_SET: {bool(TELEGRAM_TOKEN)}")
-    print(f"[BOOT] TELEGRAM_CHAT_ID_SET: {bool(TELEGRAM_CHAT_ID)}")
-    print("=" * 80)
+    print("=" * 80, flush=True)
+    print("[BOOT] Bot starting...", flush=True)
+    print(f"[BOOT] NY TIME: {fmt_ny()}", flush=True)
+    print(f"[BOOT] Session: {get_session_name(now_ny().hour)}", flush=True)
+    print(f"[BOOT] PORT: {PORT}", flush=True)
+    print(f"[BOOT] TWELVEDATA_API_KEY_SET: {bool(TWELVEDATA_API_KEY)}", flush=True)
+    print(f"[BOOT] TELEGRAM_TOKEN_SET: {bool(TELEGRAM_TOKEN)}", flush=True)
+    print(f"[BOOT] TELEGRAM_CHAT_ID_SET: {bool(TELEGRAM_CHAT_ID)}", flush=True)
+    print("=" * 80, flush=True)
 
     startup_message()
     start_background_scanner()
     app.run(host="0.0.0.0", port=PORT)
-    
-def start_background_scan():
-    t = threading.Thread(target=scan_loop)
-    t.daemon = True
-    t.start()
-
-start_background_scan()
