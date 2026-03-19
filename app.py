@@ -31,13 +31,19 @@ PAIR_GROUPS = [
     ["AUD/JPY", "CAD/JPY", "EUR/GBP", "GBP/CHF"],
 ]
 
-ALL_PAIRS = [pair for group in PAIR_GROUPS for pair in group]
+ALL_PAIRS = [p for g in PAIR_GROUPS for p in g]
 
 SCAN_INTERVAL_SECONDS = 60
 COOLDOWN_SECONDS = 1800
 REQUEST_TIMEOUT = 20
-CANDLE_INTERVAL = "5min"
-OUTPUTSIZE = 100
+
+PRIMARY_INTERVAL = "5min"
+PRIMARY_OUTPUTSIZE = 100
+MICRO_INTERVAL = "1min"
+MICRO_OUTPUTSIZE = 50
+
+PAIR_CACHE = {}
+CACHE_LOCK = threading.Lock()
 
 LAST_SIGNAL = {}
 LATEST_STATUS = {
@@ -66,25 +72,25 @@ ATR_PERIOD = 7
 MIN_CONFIDENCE = 72
 
 SESSION_MIN_CONFIDENCE = {
-    "TOKYO": 76,
-    "TOKYO + LONDON": 73,
+    "TOKYO": 78,
+    "TOKYO + LONDON": 74,
     "NEW YORK": 72,
-    "LOW LIQUIDITY": 82,
+    "LOW LIQUIDITY": 84,
 }
 
 ATR_MIN_BY_SYMBOL = {
-    "EUR/USD": 0.0006,
-    "GBP/USD": 0.0008,
-    "USD/JPY": 0.06,
-    "AUD/USD": 0.0006,
-    "USD/CAD": 0.0007,
-    "NZD/USD": 0.0006,
-    "EUR/JPY": 0.07,
-    "GBP/JPY": 0.10,
-    "AUD/JPY": 0.07,
-    "CAD/JPY": 0.06,
-    "EUR/GBP": 0.0004,
-    "GBP/CHF": 0.0009,
+    "EUR/USD": 0.00045,
+    "GBP/USD": 0.00065,
+    "USD/JPY": 0.045,
+    "AUD/USD": 0.00045,
+    "USD/CAD": 0.00055,
+    "NZD/USD": 0.00045,
+    "EUR/JPY": 0.055,
+    "GBP/JPY": 0.080,
+    "AUD/JPY": 0.055,
+    "CAD/JPY": 0.045,
+    "EUR/GBP": 0.00030,
+    "GBP/CHF": 0.00070,
 }
 
 # =========================
@@ -104,722 +110,211 @@ def fmt_ny(dt=None):
 def safe_float(x, default=None):
     try:
         return float(x)
-    except Exception:
+    except:
         return default
 
 def clamp(n, smallest, largest):
     return max(smallest, min(n, largest))
 
 def mean(values):
-    if not values:
-        return 0.0
-    return sum(values) / len(values)
+    return sum(values) / len(values) if values else 0.0
 
 def stddev(values):
     if not values:
         return 0.0
     m = mean(values)
-    variance = sum((x - m) ** 2 for x in values) / len(values)
-    return math.sqrt(variance)
+    return math.sqrt(sum((x - m) ** 2 for x in values) / len(values))
 
 def send_telegram_message(text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[WARN] Telegram env eksik. Mesaj gönderilemedi.", flush=True)
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text
-    }
-
     try:
-        r = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-        if r.status_code == 200:
-            return True
-        print(f"[ERROR] Telegram gönderilemedi: {r.status_code} - {r.text}", flush=True)
-        return False
-    except Exception as e:
-        print(f"[ERROR] Telegram exception: {e}", flush=True)
+        r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=REQUEST_TIMEOUT)
+        return r.status_code == 200
+    except:
         return False
 
-def get_session_name(hour_ny: int):
-    if 19 <= hour_ny <= 23:
+def get_session_name(hour):
+    if 19 <= hour <= 23:
         return "TOKYO"
-    elif 0 <= hour_ny <= 11:
+    elif 0 <= hour <= 11:
         return "TOKYO + LONDON"
-    elif 12 <= hour_ny <= 16:
+    elif 12 <= hour <= 16:
         return "NEW YORK"
     else:
         return "LOW LIQUIDITY"
 
-def get_active_pairs_for_session(session_name):
-    # Kullanıcının istediği gibi aynı anda 12 pair taranır
-    LATEST_STATUS["last_group"] = "ALL"
-    return ALL_PAIRS
-
-def symbol_to_twelvedata(symbol):
-    return symbol.strip()
+def cooldown_remaining(symbol, direction):
+    d = LAST_SIGNAL.get(symbol)
+    if not d or d["direction"] != direction:
+        return 0
+    return max(0, int(COOLDOWN_SECONDS - (time.time() - d["time"])))
 
 # =========================
-# MARKET DATA
+# DATA
 # =========================
-def fetch_twelvedata_candles(symbol, interval=CANDLE_INTERVAL, outputsize=OUTPUTSIZE):
-    if not TWELVEDATA_API_KEY:
-        raise RuntimeError("TWELVEDATA_API_KEY eksik")
-
-    td_symbol = symbol_to_twelvedata(symbol)
+def fetch_candles(symbol, interval="5min", outputsize=100):
     url = "https://api.twelvedata.com/time_series"
     params = {
-        "symbol": td_symbol,
+        "symbol": symbol,
         "interval": interval,
         "outputsize": outputsize,
         "apikey": TWELVEDATA_API_KEY,
-        "format": "JSON"
     }
-
-    print(f"[FETCH] {symbol} ({interval}, {outputsize})", flush=True)
     r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-
-    try:
-        data = r.json()
-    except Exception:
-        raise RuntimeError(f"TwelveData JSON parse hatası: HTTP {r.status_code} - {r.text[:300]}")
-
-    if r.status_code != 200:
-        raise RuntimeError(f"TwelveData HTTP error for {symbol}: {r.status_code} - {data}")
-
-    if isinstance(data, dict) and data.get("status") == "error":
-        raise RuntimeError(f"TwelveData error for {symbol}: {data.get('message')}")
-
-    if "values" not in data or not data.get("values"):
-        raise RuntimeError(f"TwelveData values yok: {symbol} -> {data}")
+    data = r.json()
 
     values = list(reversed(data["values"]))
-    candles = []
-    for row in values:
-        candles.append({
-            "datetime": row.get("datetime"),
-            "open": safe_float(row.get("open")),
-            "high": safe_float(row.get("high")),
-            "low": safe_float(row.get("low")),
-            "close": safe_float(row.get("close")),
-        })
-
-    candles = [c for c in candles if None not in (c["open"], c["high"], c["low"], c["close"])]
-
-    if not candles:
-        raise RuntimeError(f"TwelveData geçerli candle dönmedi: {symbol}")
-
-    print(f"[FETCH OK] {symbol} candles={len(candles)}", flush=True)
-    return candles
+    return [{
+        "open": float(v["open"]),
+        "high": float(v["high"]),
+        "low": float(v["low"]),
+        "close": float(v["close"])
+    } for v in values]
 
 # =========================
 # INDICATORS
 # =========================
-def ema(values, period):
-    if len(values) < period:
-        return []
-    result = []
-    k = 2 / (period + 1)
-    sma = sum(values[:period]) / period
-    result.extend([None] * (period - 1))
-    result.append(sma)
+def ema(vals, p):
+    k = 2/(p+1)
+    out = [None]*(p-1)
+    sma = sum(vals[:p])/p
+    out.append(sma)
     prev = sma
-    for price in values[period:]:
-        current = (price * k) + (prev * (1 - k))
-        result.append(current)
-        prev = current
-    return result
+    for v in vals[p:]:
+        prev = v*k + prev*(1-k)
+        out.append(prev)
+    return out
 
-def rsi(values, period=14):
-    if len(values) < period + 1:
-        return []
+def rsi(vals, p=14):
+    gains, losses = [], []
+    for i in range(1, p+1):
+        d = vals[i]-vals[i-1]
+        gains.append(max(d,0))
+        losses.append(max(-d,0))
 
-    gains = []
-    losses = []
-    for i in range(1, period + 1):
-        change = values[i] - values[i - 1]
-        gains.append(max(change, 0))
-        losses.append(max(-change, 0))
+    ag, al = sum(gains)/p, sum(losses)/p
+    rs = ag/al if al else 0
+    out = [None]*p + [100-(100/(1+rs))]
 
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
+    for i in range(p+1, len(vals)):
+        d = vals[i]-vals[i-1]
+        ag = (ag*(p-1)+max(d,0))/p
+        al = (al*(p-1)+max(-d,0))/p
+        rs = ag/al if al else 0
+        out.append(100-(100/(1+rs)))
+    return out
 
-    rsis = [None] * period
-    if avg_loss == 0:
-        rsis.append(100.0)
-    else:
-        rs = avg_gain / avg_loss
-        rsis.append(100 - (100 / (1 + rs)))
-
-    for i in range(period + 1, len(values)):
-        change = values[i] - values[i - 1]
-        gain = max(change, 0)
-        loss = max(-change, 0)
-
-        avg_gain = ((avg_gain * (period - 1)) + gain) / period
-        avg_loss = ((avg_loss * (period - 1)) + loss) / period
-
-        if avg_loss == 0:
-            rsis.append(100.0)
-        else:
-            rs = avg_gain / avg_loss
-            rsis.append(100 - (100 / (1 + rs)))
-
-    return rsis
-
-def bollinger_bands(values, period=20, std_multiplier=2.0):
-    if len(values) < period:
-        return [], [], []
-
-    middle = []
-    upper = []
-    lower = []
-
-    for i in range(len(values)):
-        if i < period - 1:
-            middle.append(None)
-            upper.append(None)
-            lower.append(None)
+def bollinger(vals, p=20, s=2):
+    mid, up, lo = [], [], []
+    for i in range(len(vals)):
+        if i < p-1:
+            mid.append(None); up.append(None); lo.append(None)
             continue
+        w = vals[i-p+1:i+1]
+        m = mean(w); sd = stddev(w)
+        mid.append(m)
+        up.append(m+s*sd)
+        lo.append(m-s*sd)
+    return mid, up, lo
 
-        window = values[i - period + 1:i + 1]
-        m = mean(window)
-        sd = stddev(window)
-        middle.append(m)
-        upper.append(m + std_multiplier * sd)
-        lower.append(m - std_multiplier * sd)
-
-    return middle, upper, lower
-
-def atr(highs, lows, closes, period=7):
-    if len(closes) < period + 1:
-        return []
-
-    true_ranges = []
-    for i in range(1, len(closes)):
-        tr = max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i - 1]),
-            abs(lows[i] - closes[i - 1])
-        )
-        true_ranges.append(tr)
-
-    if len(true_ranges) < period:
-        return []
-
-    atr_vals = [None] * period
-    first_atr = sum(true_ranges[:period]) / period
-    atr_vals.append(first_atr)
-
-    prev_atr = first_atr
-    for tr in true_ranges[period:]:
-        current_atr = ((prev_atr * (period - 1)) + tr) / period
-        atr_vals.append(current_atr)
-        prev_atr = current_atr
-
-    while len(atr_vals) < len(closes):
-        atr_vals.insert(0, None)
-
-    return atr_vals[-len(closes):]
-
-def slope(series, i, length=3):
-    if i - length < 0:
-        return 0.0
-    return series[i] - series[i - length]
-
-def avg_body_ratio(closes, opens, highs, lows, i, length=3):
-    start = max(0, i - length + 1)
-    ratios = []
-    for idx in range(start, i + 1):
-        body = abs(closes[idx] - opens[idx])
-        rng = highs[idx] - lows[idx] if highs[idx] - lows[idx] != 0 else 1e-9
-        ratios.append(body / rng)
-    return mean(ratios)
+def atr(h, l, c, p=7):
+    tr = [max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])) for i in range(1,len(c))]
+    out = [None]*p + [sum(tr[:p])/p]
+    for t in tr[p:]:
+        out.append((out[-1]*(p-1)+t)/p)
+    return [None]+out
 
 # =========================
-# SIGNAL ENGINE
+# SIGNAL
 # =========================
-def analyze_symbol(symbol):
-    candles = fetch_twelvedata_candles(symbol, interval=CANDLE_INTERVAL, outputsize=OUTPUTSIZE)
-    if len(candles) < 60:
-        raise RuntimeError(f"Yetersiz veri: {symbol}")
+def analyze(symbol):
+    data = fetch_candles(symbol)
+    c = [x["close"] for x in data]
+    h = [x["high"] for x in data]
+    l = [x["low"] for x in data]
 
-    closes = [c["close"] for c in candles]
-    highs = [c["high"] for c in candles]
-    lows = [c["low"] for c in candles]
-    opens = [c["open"] for c in candles]
+    ema9 = ema(c,9)
+    ema21 = ema(c,21)
+    r = rsi(c)
+    _, u, lo = bollinger(c)
+    a = atr(h,l,c)
 
-    ema_fast = ema(closes, EMA_FAST)
-    ema_slow = ema(closes, EMA_SLOW)
-    rsi_vals = rsi(closes, RSI_PERIOD)
-    bb_mid, bb_upper, bb_lower = bollinger_bands(closes, BB_PERIOD, BB_STDDEV)
-    atr_vals = atr(highs, lows, closes, ATR_PERIOD)
+    i = len(c)-1
 
-    i = len(closes) - 1
-    needed_arrays = [ema_fast, ema_slow, rsi_vals, bb_mid, bb_upper, bb_lower, atr_vals]
-    if any(len(arr) == 0 or arr[i] is None for arr in needed_arrays):
-        raise RuntimeError(f"Göstergeler hazır değil: {symbol}")
+    if None in (ema9[i], ema21[i], r[i], u[i], lo[i], a[i]):
+        return None
 
-    close = closes[i]
-    prev_close = closes[i - 1]
-    current_rsi = rsi_vals[i]
-    prev_rsi = rsi_vals[i - 1]
-    ema_fast_now = ema_fast[i]
-    ema_slow_now = ema_slow[i]
-    bb_u = bb_upper[i]
-    bb_l = bb_lower[i]
-    bb_m = bb_mid[i]
-    atr_now = atr_vals[i]
+    up = ema9[i] > ema21[i] and c[i] > ema9[i]
+    down = ema9[i] < ema21[i] and c[i] < ema9[i]
 
-    candle_body = abs(closes[i] - opens[i])
-    candle_range = highs[i] - lows[i] if highs[i] - lows[i] != 0 else 1e-9
-    upper_wick = highs[i] - max(opens[i], closes[i])
-    lower_wick = min(opens[i], closes[i]) - lows[i]
-    body_ratio = candle_body / candle_range
-
-    prev_body = abs(closes[i - 1] - opens[i - 1])
-    prev_range = highs[i - 1] - lows[i - 1] if highs[i - 1] - lows[i - 1] != 0 else 1e-9
-    prev_body_ratio = prev_body / prev_range
-
-    uptrend = ema_fast_now > ema_slow_now and close > ema_fast_now
-    downtrend = ema_fast_now < ema_slow_now and close < ema_fast_now
-
-    rsi_rising = current_rsi > prev_rsi
-    rsi_falling = current_rsi < prev_rsi
-
-    rsi_3_up = rsi_vals[i] > rsi_vals[i - 1] > rsi_vals[i - 2]
-    rsi_3_down = rsi_vals[i] < rsi_vals[i - 1] < rsi_vals[i - 2]
-
-    band_width = abs(bb_u - bb_l)
-    near_upper = close >= (bb_u - (band_width * 0.10))
-    near_lower = close <= (bb_l + (band_width * 0.10))
-
-    small_body = body_ratio < 0.35
-    upper_rejection = upper_wick > candle_body * 1.2 if candle_body > 0 else False
-    lower_rejection = lower_wick > candle_body * 1.2 if candle_body > 0 else False
-
-    dist_to_mid = abs(close - bb_m)
-    too_close_to_mid = band_width > 0 and dist_to_mid < band_width * 0.08
-
-    # =========================
-    # ADVANCED FILTERS
-    # =========================
-    atr_floor = ATR_MIN_BY_SYMBOL.get(symbol, 0.0005)
-    low_volatility = atr_now < atr_floor
-
-    ema_gap_now = abs(ema_fast[i] - ema_slow[i])
-    ema_gap_prev = abs(ema_fast[i - 1] - ema_slow[i - 1])
-    ema_gap_prev2 = abs(ema_fast[i - 2] - ema_slow[i - 2])
-
-    ma_angle_expanding = ema_gap_now > ema_gap_prev > ema_gap_prev2
-    ma_angle_compression = ema_gap_now < ema_gap_prev and ema_gap_prev < ema_gap_prev2
-
-    recent_avg_body_ratio = avg_body_ratio(closes, opens, highs, lows, i, 3)
-    previous_avg_body_ratio = avg_body_ratio(closes, opens, highs, lows, i - 1, 3) if i - 1 >= 2 else recent_avg_body_ratio
-    trend_fatigue = recent_avg_body_ratio < previous_avg_body_ratio and body_ratio < prev_body_ratio
-
-    band_exhaustion_up = (
-        closes[i] >= bb_u and closes[i - 1] >= bb_upper[i - 1] and closes[i - 2] >= bb_upper[i - 2]
-        and current_rsi > 65
-        and ma_angle_compression
-        and trend_fatigue
-    )
-
-    band_exhaustion_down = (
-        closes[i] <= bb_l and closes[i - 1] <= bb_lower[i - 1] and closes[i - 2] <= bb_lower[i - 2]
-        and current_rsi < 35
-        and ma_angle_compression
-        and trend_fatigue
-    )
-
-    immediate_spike_down = (
-        upper_wick > candle_body * 1.8 and
-        close < open and
-        near_upper
-    )
-
-    immediate_spike_up = (
-        lower_wick > candle_body * 1.8 and
-        close > open and
-        near_lower
-    )
-
-    rsi_flat = abs(current_rsi - rsi_vals[i - 2]) < 1.5
-    weak_momentum_band = 35 <= current_rsi <= 45 or 55 <= current_rsi <= 65
-
-    momentum_guard_block_up = (
-        not rsi_3_up or
-        (ma_angle_compression and weak_momentum_band) or
-        rsi_flat
-    )
-
-    momentum_guard_block_down = (
-        not rsi_3_down or
-        (ma_angle_compression and weak_momentum_band) or
-        rsi_flat
-    )
-
+    conf = 0
     direction = None
-    confidence = 0
-    reason_parts = []
-    blocked_by = []
 
-    # BUY setup
-    if uptrend and rsi_rising:
-        confidence += 30
-        reason_parts.append("trend up")
-        reason_parts.append("RSI rising")
-
-        if near_upper:
-            confidence += 18
-            reason_parts.append("price near upper band")
-        if close > prev_close:
-            confidence += 10
-            reason_parts.append("bullish continuation")
-        if body_ratio > 0.45:
-            confidence += 10
-            reason_parts.append("healthy candle body")
-        if lower_rejection:
-            confidence += 6
-            reason_parts.append("lower wick support")
-        if ma_angle_expanding:
-            confidence += 8
-            reason_parts.append("MA gap expanding")
-        if upper_rejection and small_body:
-            confidence -= 14
-            reason_parts.append("possible exhaustion")
-
+    if up:
         direction = "UP"
+        conf += 30
+        if r[i] > 50: conf += 10
+        if c[i] > c[i-1]: conf += 10
 
-    # SELL setup
-    elif downtrend and rsi_falling:
-        confidence += 30
-        reason_parts.append("trend down")
-        reason_parts.append("RSI falling")
-
-        if near_lower:
-            confidence += 18
-            reason_parts.append("price near lower band")
-        if close < prev_close:
-            confidence += 10
-            reason_parts.append("bearish continuation")
-        if body_ratio > 0.45:
-            confidence += 10
-            reason_parts.append("healthy candle body")
-        if upper_rejection:
-            confidence += 6
-            reason_parts.append("upper wick pressure")
-        if ma_angle_expanding:
-            confidence += 8
-            reason_parts.append("MA gap expanding")
-        if lower_rejection and small_body:
-            confidence -= 14
-            reason_parts.append("possible exhaustion")
-
+    elif down:
         direction = "DOWN"
+        conf += 30
+        if r[i] < 50: conf += 10
+        if c[i] < c[i-1]: conf += 10
 
-    else:
-        return {
-            "symbol": symbol,
-            "signal": None,
-            "confidence": 0,
-            "reason": "Net trend + momentum yok",
-            "blocked_by": [],
-            "price": close,
-            "rsi": round(current_rsi, 2),
-            "atr": round(atr_now, 6),
-            "ema_fast": round(ema_fast_now, 5),
-            "ema_slow": round(ema_slow_now, 5),
-        }
+    if a[i] < ATR_MIN_BY_SYMBOL.get(symbol,0.0005):
+        conf -= 20
 
-    # Advanced risk filters
-    if low_volatility:
-        confidence -= 18
-        blocked_by.append("low volatility / ATR gate")
-
-    if too_close_to_mid:
-        confidence -= 12
-        blocked_by.append("too close to mid band")
-
-    if direction == "UP" and current_rsi > 72:
-        confidence -= 10
-        blocked_by.append("RSI too hot")
-
-    if direction == "DOWN" and current_rsi < 28:
-        confidence -= 10
-        blocked_by.append("RSI too stretched")
-
-    if direction == "UP" and momentum_guard_block_up:
-        confidence -= 16
-        blocked_by.append("momentum guard blocked")
-
-    if direction == "DOWN" and momentum_guard_block_down:
-        confidence -= 16
-        blocked_by.append("momentum guard blocked")
-
-    if direction == "UP" and band_exhaustion_up:
-        confidence -= 18
-        blocked_by.append("band exhaustion up")
-
-    if direction == "DOWN" and band_exhaustion_down:
-        confidence -= 18
-        blocked_by.append("band exhaustion down")
-
-    if direction == "UP" and immediate_spike_down:
-        confidence -= 20
-        blocked_by.append("spike reversal shield")
-
-    if direction == "DOWN" and immediate_spike_up:
-        confidence -= 20
-        blocked_by.append("spike reversal shield")
-
-    if trend_fatigue:
-        confidence -= 8
-        blocked_by.append("trend fatigue")
-
-    confidence = clamp(confidence, 0, 99)
-
-    if blocked_by:
-        reason_parts.extend(blocked_by)
-
-    return {
-        "symbol": symbol,
-        "signal": direction,
-        "confidence": confidence,
-        "reason": ", ".join(reason_parts),
-        "blocked_by": blocked_by,
-        "price": close,
-        "rsi": round(current_rsi, 2),
-        "atr": round(atr_now, 6),
-        "ema_fast": round(ema_fast_now, 5),
-        "ema_slow": round(ema_slow_now, 5),
-    }
-
-def is_on_cooldown(symbol, direction):
-    data = LAST_SIGNAL.get(symbol)
-    if not data:
-        return False
-
-    elapsed = time.time() - data["time"]
-    return elapsed < COOLDOWN_SECONDS and data["direction"] == direction
-
-def mark_signal(symbol, direction):
-    LAST_SIGNAL[symbol] = {
-        "direction": direction,
-        "time": time.time()
-    }
-
-def build_signal_message(result, session_name):
-    arrow = "⬆️" if result["signal"] == "UP" else "⬇️"
-    direction_tr = "YUKARI" if result["signal"] == "UP" else "AŞAĞI"
-
-    blocked_text = ", ".join(result.get("blocked_by", [])) if result.get("blocked_by") else "Yok"
-
-    return (
-        f"🚨 SİNYAL\n"
-        f"Parite: {result['symbol']}\n"
-        f"Yön: {arrow} {direction_tr}\n"
-        f"Güven: %{result['confidence']}\n"
-        f"Session: {session_name}\n"
-        f"Fiyat: {result['price']}\n"
-        f"RSI: {result['rsi']}\n"
-        f"ATR7: {result['atr']}\n"
-        f"EMA{EMA_FAST}: {result['ema_fast']}\n"
-        f"EMA{EMA_SLOW}: {result['ema_slow']}\n"
-        f"Neden: {result['reason']}\n"
-        f"Risk Filtreleri: {blocked_text}\n"
-        f"Saat: {fmt_ny()}"
-    )
+    return {"symbol":symbol,"signal":direction,"confidence":conf}
 
 # =========================
-# SCAN LOOP
+# LOOP
 # =========================
-def scan_market_once():
-    ny = now_ny()
-    utc = now_utc()
-    session_name = get_session_name(ny.hour)
+def scan():
+    best = None
+    session = get_session_name(now_ny().hour)
 
-    LATEST_STATUS["last_scan_ny"] = fmt_ny(ny)
-    LATEST_STATUS["last_scan_utc"] = utc.strftime("%Y-%m-%d %H:%M:%S UTC")
-    LATEST_STATUS["last_session"] = session_name
-    LATEST_STATUS["last_error"] = None
-    LATEST_STATUS["scanner_heartbeat"] = fmt_ny(ny)
-
-    pairs = get_active_pairs_for_session(session_name)
-    min_conf = SESSION_MIN_CONFIDENCE.get(session_name, MIN_CONFIDENCE)
-
-    print("=" * 90, flush=True)
-    print(f"[SCAN] NY TIME: {fmt_ny(ny)}", flush=True)
-    print(f"[SCAN] UTC TIME: {utc.strftime('%Y-%m-%d %H:%M:%S UTC')}", flush=True)
-    print(f"[SCAN] SESSION: {session_name}", flush=True)
-    print(f"[SCAN] GROUP: {LATEST_STATUS['last_group']}", flush=True)
-    print(f"[SCAN] PAIRS COUNT: {len(pairs)}", flush=True)
-    print(f"[SCAN] PAIRS: {pairs}", flush=True)
-    print(f"[SCAN] MIN CONFIDENCE: {min_conf}", flush=True)
-
-    best_result = None
-
-    for symbol in pairs:
+    for s in ALL_PAIRS:
         try:
-            print(f"[CHECK] Starting analysis for {symbol}", flush=True)
-            result = analyze_symbol(symbol)
-            print(f"[RESULT] {symbol} -> {result}", flush=True)
-
-            if result["signal"] is None:
+            r = analyze(s)
+            if not r or not r["signal"]:
                 continue
 
-            if result["confidence"] < min_conf:
+            if r["confidence"] < SESSION_MIN_CONFIDENCE.get(session,72):
                 continue
 
-            if is_on_cooldown(symbol, result["signal"]):
-                print(f"[COOLDOWN] {symbol} cooldown aktif.", flush=True)
+            if cooldown_remaining(s, r["signal"]) > 0:
                 continue
 
-            if (best_result is None) or (result["confidence"] > best_result["confidence"]):
-                best_result = result
+            if not best or r["confidence"] > best["confidence"]:
+                best = r
 
         except Exception as e:
-            print(f"[ERROR] {symbol}: {e}", flush=True)
+            print("ERR:", e)
 
-    if best_result:
-        msg = build_signal_message(best_result, session_name)
-        sent = send_telegram_message(msg)
-        if sent:
-            mark_signal(best_result["symbol"], best_result["signal"])
-            LATEST_STATUS["last_signal"] = {
-                "symbol": best_result["symbol"],
-                "direction": best_result["signal"],
-                "confidence": best_result["confidence"],
-                "time_ny": fmt_ny(),
-                "session": session_name,
-            }
-            LATEST_STATUS["signals_sent_today"] += 1
-            print(f"[SENT] {best_result['symbol']} {best_result['signal']} %{best_result['confidence']}", flush=True)
-        else:
-            print("[WARN] Signal bulundu ama Telegram gönderimi başarısız.", flush=True)
-    else:
-        print("[SCAN] Uygun sinyal bulunamadı.", flush=True)
+    if best:
+        msg = f"{best['symbol']} {best['signal']} %{best['confidence']}"
+        if send_telegram_message(msg):
+            LAST_SIGNAL[best["symbol"]] = {"direction":best["signal"],"time":time.time()}
 
-def scan_loop():
-    print("[SCANNER] Background scanner thread started.", flush=True)
+def loop():
     while True:
-        try:
-            scan_market_once()
-        except Exception as e:
-            LATEST_STATUS["last_error"] = str(e)
-            print(f"[FATAL SCAN ERROR] {e}", flush=True)
-
-        print(f"[SCANNER] Sleeping {SCAN_INTERVAL_SECONDS}s before next scan...", flush=True)
+        scan()
         time.sleep(SCAN_INTERVAL_SECONDS)
 
 # =========================
-# FLASK ROUTES
+# API
 # =========================
-@app.route("/", methods=["GET"])
+@app.route("/")
 def home():
-    ny = now_ny()
-    session_name = get_session_name(ny.hour)
-
-    return jsonify({
-        "status": "ok",
-        "message": "Silent Surge advanced bot is running",
-        "ny_time": fmt_ny(ny),
-        "utc_time": now_utc().strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "session": session_name,
-        "last_scan_ny": LATEST_STATUS["last_scan_ny"],
-        "last_signal": LATEST_STATUS["last_signal"],
-        "last_error": LATEST_STATUS["last_error"],
-        "group": LATEST_STATUS["last_group"],
-        "scanner_started": LATEST_STATUS["scanner_started"],
-        "scanner_heartbeat": LATEST_STATUS["scanner_heartbeat"],
-    })
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({
-        "ok": True,
-        "bot_started_ny": LATEST_STATUS["bot_started_ny"],
-        "last_scan_ny": LATEST_STATUS["last_scan_ny"],
-        "last_scan_utc": LATEST_STATUS["last_scan_utc"],
-        "last_session": LATEST_STATUS["last_session"],
-        "last_group": LATEST_STATUS["last_group"],
-        "last_error": LATEST_STATUS["last_error"],
-        "last_signal": LATEST_STATUS["last_signal"],
-        "signals_sent_today": LATEST_STATUS["signals_sent_today"],
-        "scanner_started": LATEST_STATUS["scanner_started"],
-        "scanner_heartbeat": LATEST_STATUS["scanner_heartbeat"],
-        "env": {
-            "TWELVEDATA_API_KEY_SET": bool(TWELVEDATA_API_KEY),
-            "TELEGRAM_TOKEN_SET": bool(TELEGRAM_TOKEN),
-            "TELEGRAM_CHAT_ID_SET": bool(TELEGRAM_CHAT_ID),
-        }
-    })
-
-@app.route("/test-time", methods=["GET"])
-def test_time():
-    ny = now_ny()
-    return jsonify({
-        "ny_time_full": fmt_ny(ny),
-        "hour": ny.hour,
-        "minute": ny.minute,
-        "session": get_session_name(ny.hour),
-    })
-
-@app.route("/test-scan", methods=["GET"])
-def test_scan():
-    try:
-        scan_market_once()
-        return jsonify({
-            "ok": True,
-            "message": "Manual scan completed",
-            "last_signal": LATEST_STATUS["last_signal"],
-            "last_error": LATEST_STATUS["last_error"],
-        })
-    except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": str(e)
-        }), 500
+    return jsonify({"status":"running","time":fmt_ny()})
 
 # =========================
-# STARTUP
+# START
 # =========================
-def startup_message():
-    text = (
-        f"✅ Bot başlatıldı\n"
-        f"NY Time: {fmt_ny()}\n"
-        f"Session: {get_session_name(now_ny().hour)}\n"
-        f"Pairs: {len(ALL_PAIRS)}\n"
-        f"Scan interval: {SCAN_INTERVAL_SECONDS}s\n"
-        f"Cooldown: {COOLDOWN_SECONDS}s\n"
-        f"Mode: Silent Surge Advanced"
-    )
-    send_telegram_message(text)
-
-def start_background_scanner():
-    if LATEST_STATUS["scanner_started"]:
-        print("[SCANNER] Scanner zaten başlatılmış.", flush=True)
-        return
-
-    t = threading.Thread(target=scan_loop, daemon=True, name="market-scanner")
-    t.start()
-    LATEST_STATUS["scanner_started"] = True
-    print(f"[SCANNER] Thread started: {t.name}", flush=True)
-
 if __name__ == "__main__":
-    LATEST_STATUS["bot_started_ny"] = fmt_ny()
-    print("=" * 90, flush=True)
-    print("[BOOT] Bot starting...", flush=True)
-    print(f"[BOOT] NY TIME: {fmt_ny()}", flush=True)
-    print(f"[BOOT] Session: {get_session_name(now_ny().hour)}", flush=True)
-    print(f"[BOOT] PORT: {PORT}", flush=True)
-    print(f"[BOOT] TWELVEDATA_API_KEY_SET: {bool(TWELVEDATA_API_KEY)}", flush=True)
-    print(f"[BOOT] TELEGRAM_TOKEN_SET: {bool(TELEGRAM_TOKEN)}", flush=True)
-    print(f"[BOOT] TELEGRAM_CHAT_ID_SET: {bool(TELEGRAM_CHAT_ID)}", flush=True)
-    print("=" * 90, flush=True)
-
-    startup_message()
-    start_background_scanner()
+    threading.Thread(target=loop, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT)
