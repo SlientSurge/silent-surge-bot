@@ -36,16 +36,24 @@ SCAN_INTERVAL_SECONDS = 60
 COOLDOWN_SECONDS = 1800
 REQUEST_TIMEOUT = 20
 MAX_TELEGRAM_TEXT = 3900
-MAX_LOG_ITEMS = 1000
-
-PRIMARY_INTERVAL = "1min"
-PRIMARY_OUTPUTSIZE = 120
+MAX_LOG_ITEMS = 1500
+PRIMARY_OUTPUTSIZE = 140
 
 STATE_LOCK = threading.Lock()
 
 LAST_SIGNAL = {}
 PAIR_STATS = {}
 SIGNAL_LOG = []
+
+PERFORMANCE_DB = {
+    "by_pair": {},
+    "by_setup": {},
+    "by_session": {},
+    "by_pair_setup": {},
+    "by_pair_session": {},
+    "by_setup_session": {},
+    "by_conf_bucket": {},   # 40-49, 50-59...
+}
 
 LATEST_STATUS = {
     "bot_started_ny": None,
@@ -63,7 +71,22 @@ LATEST_STATUS = {
 }
 
 HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "SilentSurgePro/1.0"})
+HTTP.headers.update({"User-Agent": "SilentSurgeLearn/3.0"})
+
+# =========================
+# SESSION / PAIR MAP
+# =========================
+PAIR_PRIORITY_BY_SESSION = {
+    "TOKYO": [
+        "USD/JPY", "EUR/JPY", "AUD/JPY", "CAD/JPY", "AUD/USD"
+    ],
+    "TOKYO + LONDON": [
+        "EUR/USD", "GBP/USD", "EUR/JPY", "GBP/JPY", "USD/CAD", "USD/JPY", "AUD/USD"
+    ],
+    "NEW YORK": [
+        "EUR/USD", "GBP/USD", "USD/CAD", "AUD/USD", "USD/JPY"
+    ],
+}
 
 # =========================
 # HELPERS
@@ -110,6 +133,12 @@ def parse_expiry_minutes(expiry_text):
         return 5
     return 3
 
+def confidence_bucket(conf):
+    lo = int(conf // 10) * 10
+    lo = clamp(lo, 40, 90)
+    hi = lo + 9
+    return f"{lo}-{hi}"
+
 def send_telegram_message(text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram env missing", flush=True)
@@ -137,11 +166,6 @@ def send_telegram_message(text):
 # SESSION ENGINE
 # =========================
 def get_session_name(hour):
-    # Çöp saatler kesildi:
-    # 22:00-23:59 -> TOKYO
-    # 00:00-11:59 -> TOKYO + LONDON
-    # 12:00-16:59 -> NEW YORK
-    # diğer saatler -> LOW LIQUIDITY
     if 22 <= hour <= 23:
         return "TOKYO"
     elif 0 <= hour <= 11:
@@ -162,10 +186,13 @@ def session_min_rank(session_name):
         return ["A+", "A", "B"]
     return []
 
+def get_pairs_for_session(session_name):
+    return PAIR_PRIORITY_BY_SESSION.get(session_name, [])
+
 # =========================
 # DATA
 # =========================
-def fetch_candles(symbol, interval="1min", outputsize=120):
+def fetch_candles(symbol, interval="1min", outputsize=140):
     if not TWELVEDATA_API_KEY:
         raise ValueError("TWELVEDATA_API_KEY missing")
 
@@ -293,11 +320,7 @@ def atr(candles, period=14):
         high = candles[i]["high"]
         low = candles[i]["low"]
         prev_close = candles[i - 1]["close"]
-        tr = max(
-            high - low,
-            abs(high - prev_close),
-            abs(low - prev_close)
-        )
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
         trs.append(tr)
 
     if len(trs) < period:
@@ -307,6 +330,33 @@ def atr(candles, period=14):
 
 def candle_range(candle):
     return candle["high"] - candle["low"]
+
+def candle_body(candle):
+    return abs(candle["close"] - candle["open"])
+
+def upper_wick(candle):
+    return candle["high"] - max(candle["open"], candle["close"])
+
+def lower_wick(candle):
+    return min(candle["open"], candle["close"]) - candle["low"]
+
+def body_to_range_ratio(candle):
+    rng = candle_range(candle)
+    if rng <= 0:
+        return 0.0
+    return candle_body(candle) / rng
+
+def upper_wick_ratio(candle):
+    rng = candle_range(candle)
+    if rng <= 0:
+        return 0.0
+    return upper_wick(candle) / rng
+
+def lower_wick_ratio(candle):
+    rng = candle_range(candle)
+    if rng <= 0:
+        return 0.0
+    return lower_wick(candle) / rng
 
 def get_5m_trend(closes_5m):
     if len(closes_5m) < 20:
@@ -394,6 +444,210 @@ def hard_no_trade_filter(price, regime, rsi_1m, atr_1m, ema_fast, ema_slow, uppe
     if abs(ema_fast - ema_slow) < price * 0.00005:
         return True
     return False
+
+def small_body_filter(candles_1m):
+    if not candles_1m:
+        return True
+    return body_to_range_ratio(candles_1m[-1]) < 0.30
+
+def wick_rejection_filter(direction, candles_1m):
+    if not candles_1m:
+        return False
+    last = candles_1m[-1]
+
+    if direction == "BUY":
+        return upper_wick_ratio(last) >= 0.50
+    elif direction == "SELL":
+        return lower_wick_ratio(last) >= 0.50
+    return False
+
+def late_entry_guard(direction, current, upper, lower, atr_1m):
+    if None in (current, upper, lower, atr_1m):
+        return True
+
+    if direction == "BUY":
+        overshoot = current - upper
+        if overshoot > atr_1m * 0.45:
+            return True
+
+    if direction == "SELL":
+        overshoot = lower - current
+        if overshoot > atr_1m * 0.45:
+            return True
+
+    return False
+
+def fake_breakout_filter(direction, candles_1m, upper, lower, mid, atr_1m):
+    if not candles_1m or len(candles_1m) < 3:
+        return False
+
+    c2 = candles_1m[-2]
+    c3 = candles_1m[-1]
+    rng2 = candle_range(c2)
+    rng3 = candle_range(c3)
+
+    if direction == "BUY":
+        if c2["close"] > upper:
+            if body_to_range_ratio(c2) < 0.35:
+                return True
+            if upper_wick_ratio(c2) > 0.45:
+                return True
+            if c3["close"] < c2["close"] and upper_wick_ratio(c3) > 0.45:
+                return True
+            if (c2["close"] - upper) > atr_1m * 0.60:
+                return True
+            if rng2 > 0 and rng3 > 0 and rng3 < rng2 * 0.45 and c3["close"] <= c2["close"]:
+                return True
+
+    if direction == "SELL":
+        if c2["close"] < lower:
+            if body_to_range_ratio(c2) < 0.35:
+                return True
+            if lower_wick_ratio(c2) > 0.45:
+                return True
+            if c3["close"] > c2["close"] and lower_wick_ratio(c3) > 0.45:
+                return True
+            if (lower - c2["close"]) > atr_1m * 0.60:
+                return True
+            if rng2 > 0 and rng3 > 0 and rng3 < rng2 * 0.45 and c3["close"] >= c2["close"]:
+                return True
+
+    return False
+
+def session_pair_alignment_filter(symbol, session_name):
+    return symbol in get_pairs_for_session(session_name)
+
+# =========================
+# PERFORMANCE MEMORY / LEARNING
+# =========================
+def ensure_perf_bucket(section, key):
+    if key not in PERFORMANCE_DB[section]:
+        PERFORMANCE_DB[section][key] = {
+            "signals": 0,
+            "wins": 0,
+            "losses": 0,
+            "draws": 0,
+            "win_rate": 0.0
+        }
+
+def update_perf_bucket(section, key, result):
+    ensure_perf_bucket(section, key)
+    bucket = PERFORMANCE_DB[section][key]
+    bucket["signals"] += 1
+    if result == "WIN":
+        bucket["wins"] += 1
+    elif result == "LOSS":
+        bucket["losses"] += 1
+    elif result == "DRAW":
+        bucket["draws"] += 1
+
+    decisive = bucket["wins"] + bucket["losses"]
+    bucket["win_rate"] = round((bucket["wins"] / decisive) * 100, 2) if decisive else 0.0
+
+def update_performance_memory(entry, result):
+    pair = entry["pair"]
+    setup = entry["setup"]
+    session = entry["session"]
+    conf_bucket = confidence_bucket(entry["confidence"])
+
+    update_perf_bucket("by_pair", pair, result)
+    update_perf_bucket("by_setup", setup, result)
+    update_perf_bucket("by_session", session, result)
+    update_perf_bucket("by_pair_setup", f"{pair}|{setup}", result)
+    update_perf_bucket("by_pair_session", f"{pair}|{session}", result)
+    update_perf_bucket("by_setup_session", f"{setup}|{session}", result)
+    update_perf_bucket("by_conf_bucket", conf_bucket, result)
+
+def performance_adjustment(symbol, setup, session_name, confidence):
+    adj = 0
+
+    with STATE_LOCK:
+        ps = PERFORMANCE_DB["by_pair_setup"].get(f"{symbol}|{setup}")
+        ss = PERFORMANCE_DB["by_setup_session"].get(f"{setup}|{session_name}")
+        confb = PERFORMANCE_DB["by_conf_bucket"].get(confidence_bucket(confidence))
+        pairsess = PERFORMANCE_DB["by_pair_session"].get(f"{symbol}|{session_name}")
+
+    def calc_local(bucket):
+        if not bucket:
+            return 0
+        decisive = bucket["wins"] + bucket["losses"]
+        if decisive < 5:
+            return 0
+        wr = bucket["win_rate"]
+        if wr >= 70:
+            return 3
+        if wr >= 60:
+            return 1
+        if wr <= 35:
+            return -4
+        if wr <= 45:
+            return -2
+        return 0
+
+    adj += calc_local(ps)
+    adj += calc_local(ss)
+    adj += calc_local(confb)
+    adj += calc_local(pairsess)
+
+    return clamp(adj, -8, 6)
+
+def is_blacklist_candidate(symbol, setup, session_name):
+    with STATE_LOCK:
+        ps = PERFORMANCE_DB["by_pair_setup"].get(f"{symbol}|{setup}")
+        pss = PERFORMANCE_DB["by_pair_session"].get(f"{symbol}|{session_name}")
+
+    for bucket in (ps, pss):
+        if not bucket:
+            continue
+        decisive = bucket["wins"] + bucket["losses"]
+        if decisive >= 6 and bucket["win_rate"] <= 30:
+            return True
+
+    return False
+
+def top_bucket_items(section, limit=10, min_decisive=3):
+    with STATE_LOCK:
+        items = list(PERFORMANCE_DB[section].items())
+
+    scored = []
+    for key, val in items:
+        decisive = val["wins"] + val["losses"]
+        if decisive < min_decisive:
+            continue
+        scored.append({
+            "key": key,
+            "signals": val["signals"],
+            "wins": val["wins"],
+            "losses": val["losses"],
+            "draws": val["draws"],
+            "win_rate": val["win_rate"],
+            "decisive": decisive
+        })
+
+    scored.sort(key=lambda x: (x["win_rate"], x["decisive"]), reverse=True)
+    return scored[:limit]
+
+def bottom_bucket_items(section, limit=10, min_decisive=3):
+    with STATE_LOCK:
+        items = list(PERFORMANCE_DB[section].items())
+
+    scored = []
+    for key, val in items:
+        decisive = val["wins"] + val["losses"]
+        if decisive < min_decisive:
+            continue
+        scored.append({
+            "key": key,
+            "signals": val["signals"],
+            "wins": val["wins"],
+            "losses": val["losses"],
+            "draws": val["draws"],
+            "win_rate": val["win_rate"],
+            "decisive": decisive
+        })
+
+    scored.sort(key=lambda x: (x["win_rate"], -x["decisive"]))
+    return scored[:limit]
 
 # =========================
 # SCORING / EXPIRY
@@ -519,7 +773,7 @@ def get_confidence_quality_rank(direction, current, prev, upper, lower,
     return confidence, quality, rank
 
 def build_signal(symbol, setup, direction, current, prev, rsi_1m,
-                 upper, mid, lower, atr_1m, ema_fast, ema_slow, trend_5m):
+                 upper, mid, lower, atr_1m, ema_fast, ema_slow, trend_5m, session_name):
     market_state = classify_market_state(
         setup, direction, rsi_1m, trend_5m, ema_fast, ema_slow, current, mid
     )
@@ -528,6 +782,20 @@ def build_signal(symbol, setup, direction, current, prev, rsi_1m,
         direction, current, prev, upper, lower,
         rsi_1m, ema_fast, ema_slow, trend_5m, atr_1m, setup, market_state
     )
+
+    # öğrenen ayar
+    learn_adj = performance_adjustment(symbol, setup, session_name, confidence)
+    confidence = clamp(confidence + learn_adj, 40, 95)
+
+    if confidence >= 92:
+        quality = "Strong"
+        rank = "A+"
+    elif confidence >= 80:
+        quality = "Good"
+        rank = "A"
+    else:
+        quality = "Moderate"
+        rank = "B"
 
     return {
         "setup": setup,
@@ -546,13 +814,14 @@ def build_signal(symbol, setup, direction, current, prev, rsi_1m,
         "rank": rank,
         "trend_5m": trend_5m,
         "signal_time_utc": iso_utc(),
-        "signal_time_ny": fmt_ny()
+        "signal_time_ny": fmt_ny(),
+        "learn_adjustment": learn_adj
     }
 
 # =========================
 # SETUPS
 # =========================
-def check_exhaustion_reversal(symbol, closes_1m, closes_5m, atr_1m):
+def check_exhaustion_reversal(symbol, closes_1m, closes_5m, candles_1m, atr_1m, session_name):
     current = closes_1m[-1]
     prev = closes_1m[-2]
 
@@ -582,22 +851,30 @@ def check_exhaustion_reversal(symbol, closes_1m, closes_5m, atr_1m):
     if buy_trigger and trend_5m in ["UP", "FLAT"]:
         if trend_exhaustion_filter("BUY", closes_1m, rsi_1m):
             return None
+        if wick_rejection_filter("BUY", candles_1m):
+            return None
+        if small_body_filter(candles_1m):
+            return None
         return build_signal(
             symbol, "EXHAUSTION_REVERSAL", "BUY", current, prev, rsi_1m,
-            upper, mid, lower, atr_1m, ema_fast, ema_slow, trend_5m
+            upper, mid, lower, atr_1m, ema_fast, ema_slow, trend_5m, session_name
         )
 
     if sell_trigger and trend_5m in ["DOWN", "FLAT"]:
         if trend_exhaustion_filter("SELL", closes_1m, rsi_1m):
             return None
+        if wick_rejection_filter("SELL", candles_1m):
+            return None
+        if small_body_filter(candles_1m):
+            return None
         return build_signal(
             symbol, "EXHAUSTION_REVERSAL", "SELL", current, prev, rsi_1m,
-            upper, mid, lower, atr_1m, ema_fast, ema_slow, trend_5m
+            upper, mid, lower, atr_1m, ema_fast, ema_slow, trend_5m, session_name
         )
 
     return None
 
-def check_breakout_retest(symbol, closes_1m, closes_5m, atr_1m):
+def check_breakout_retest(symbol, closes_1m, closes_5m, candles_1m, atr_1m, session_name):
     current = closes_1m[-1]
     prev = closes_1m[-2]
 
@@ -627,20 +904,36 @@ def check_breakout_retest(symbol, closes_1m, closes_5m, atr_1m):
     )
 
     if buy_trigger:
+        if wick_rejection_filter("BUY", candles_1m):
+            return None
+        if small_body_filter(candles_1m):
+            return None
+        if late_entry_guard("BUY", current, upper, lower, atr_1m):
+            return None
+        if fake_breakout_filter("BUY", candles_1m, upper, lower, mid, atr_1m):
+            return None
         return build_signal(
             symbol, "BREAKOUT_RETEST", "BUY", current, prev, rsi_1m,
-            upper, mid, lower, atr_1m, ema_fast, ema_slow, trend_5m
+            upper, mid, lower, atr_1m, ema_fast, ema_slow, trend_5m, session_name
         )
 
     if sell_trigger:
+        if wick_rejection_filter("SELL", candles_1m):
+            return None
+        if small_body_filter(candles_1m):
+            return None
+        if late_entry_guard("SELL", current, upper, lower, atr_1m):
+            return None
+        if fake_breakout_filter("SELL", candles_1m, upper, lower, mid, atr_1m):
+            return None
         return build_signal(
             symbol, "BREAKOUT_RETEST", "SELL", current, prev, rsi_1m,
-            upper, mid, lower, atr_1m, ema_fast, ema_slow, trend_5m
+            upper, mid, lower, atr_1m, ema_fast, ema_slow, trend_5m, session_name
         )
 
     return None
 
-def check_momentum_pullback(symbol, closes_1m, closes_5m, atr_1m):
+def check_momentum_pullback(symbol, closes_1m, closes_5m, candles_1m, atr_1m, session_name):
     current = closes_1m[-1]
     prev = closes_1m[-2]
 
@@ -670,15 +963,23 @@ def check_momentum_pullback(symbol, closes_1m, closes_5m, atr_1m):
     )
 
     if buy_trigger:
+        if wick_rejection_filter("BUY", candles_1m):
+            return None
+        if small_body_filter(candles_1m):
+            return None
         return build_signal(
             symbol, "MOMENTUM_PULLBACK", "BUY", current, prev, rsi_1m,
-            upper, mid, lower, atr_1m, ema_fast, ema_slow, trend_5m
+            upper, mid, lower, atr_1m, ema_fast, ema_slow, trend_5m, session_name
         )
 
     if sell_trigger:
+        if wick_rejection_filter("SELL", candles_1m):
+            return None
+        if small_body_filter(candles_1m):
+            return None
         return build_signal(
             symbol, "MOMENTUM_PULLBACK", "SELL", current, prev, rsi_1m,
-            upper, mid, lower, atr_1m, ema_fast, ema_slow, trend_5m
+            upper, mid, lower, atr_1m, ema_fast, ema_slow, trend_5m, session_name
         )
 
     return None
@@ -686,8 +987,11 @@ def check_momentum_pullback(symbol, closes_1m, closes_5m, atr_1m):
 # =========================
 # ENGINE
 # =========================
-def signal_for_symbol(symbol):
-    candles_1m = fetch_candles(symbol, interval="1min", outputsize=120)
+def signal_for_symbol(symbol, session_name):
+    if not session_pair_alignment_filter(symbol, session_name):
+        return None
+
+    candles_1m = fetch_candles(symbol, interval="1min", outputsize=PRIMARY_OUTPUTSIZE)
     if not candles_1m or len(candles_1m) < 30:
         return None
 
@@ -719,17 +1023,17 @@ def signal_for_symbol(symbol):
     if hard_no_trade_filter(current, regime, rsi_1m, atr_1m, ema_fast, ema_slow, upper, lower):
         return None
 
-    signal = check_exhaustion_reversal(symbol, closes_1m, closes_5m, atr_1m)
+    signal = check_exhaustion_reversal(symbol, closes_1m, closes_5m, candles_1m, atr_1m, session_name)
     if signal:
         signal["regime"] = regime
         return signal
 
-    signal = check_breakout_retest(symbol, closes_1m, closes_5m, atr_1m)
+    signal = check_breakout_retest(symbol, closes_1m, closes_5m, candles_1m, atr_1m, session_name)
     if signal:
         signal["regime"] = regime
         return signal
 
-    signal = check_momentum_pullback(symbol, closes_1m, closes_5m, atr_1m)
+    signal = check_momentum_pullback(symbol, closes_1m, closes_5m, candles_1m, atr_1m, session_name)
     if signal:
         signal["regime"] = regime
         return signal
@@ -773,11 +1077,12 @@ def update_pair_stats(symbol, result):
         decisive = stats["wins"] + stats["losses"]
         stats["win_rate"] = round((stats["wins"] / decisive) * 100, 2) if decisive else 0.0
 
-def log_signal(signal):
+def log_signal(signal, session_name):
     entry = {
         "id": f"{signal['symbol']}|{signal['setup']}|{signal['direction']}|{signal['signal_time_utc']}",
         "logged_at": iso_utc(),
         "pair": signal["symbol"],
+        "session": session_name,
         "setup": signal["setup"],
         "regime": signal.get("regime", "UNKNOWN"),
         "market_state": signal["market_state"],
@@ -795,6 +1100,7 @@ def log_signal(signal):
         "bb_lower": signal["lower"],
         "signal_time_utc": signal["signal_time_utc"],
         "signal_time_ny": signal["signal_time_ny"],
+        "learn_adjustment": signal.get("learn_adjustment", 0),
         "resolve_after_utc": (now_utc() + timedelta(minutes=parse_expiry_minutes(signal["expiry"]))).isoformat(),
         "status": "OPEN",
         "result": None,
@@ -808,8 +1114,10 @@ def log_signal(signal):
             del SIGNAL_LOG[0]
 
 def build_message(signal, session_name):
+    la = signal.get("learn_adjustment", 0)
+    la_text = f"{la:+d}"
     return (
-        f"⚡ <b>SILENT SURGE PRO</b>\n\n"
+        f"⚡ <b>SILENT SURGE LEARN</b>\n\n"
         f"💱 <b>PAIR:</b> {signal['symbol']}\n"
         f"🕒 <b>SESSION:</b> {session_name}\n\n"
         f"🧩 <b>SETUP:</b> {signal['setup']}\n"
@@ -819,6 +1127,7 @@ def build_message(signal, session_name):
         f"🎯 <b>DIRECTION:</b> <b>{signal['direction']}</b>\n"
         f"⏱ <b>EXPIRY:</b> <b>{signal['expiry']}</b>\n"
         f"📊 <b>CONFIDENCE:</b> <b>{signal['confidence']}%</b>\n"
+        f"🧠 <b>LEARN ADJ:</b> {la_text}\n"
         f"🔥 <b>QUALITY:</b> {signal['quality']}\n"
         f"🧭 <b>5M TREND:</b> {signal['trend_5m']}\n\n"
         f"💰 <b>PRICE:</b> {signal['price']}\n"
@@ -869,7 +1178,9 @@ def resolve_signal_results():
                     entry["resolved_price"] = round(latest_price, 5)
                     entry["resolved_at_utc"] = iso_utc()
 
-                update_pair_stats(entry["pair"], result)
+                    update_pair_stats(entry["pair"], result)
+                    update_performance_memory(entry, result)
+
                 print(
                     f"Resolved {entry['pair']} | {entry['setup']} | {entry['direction']} | {entry['expiry']} => {result}",
                     flush=True
@@ -898,16 +1209,19 @@ def scan():
         print(f"Session blocked: {session_name}", flush=True)
         return
 
-    minute = utc.minute
-    group_idx = minute % len(PAIR_GROUPS)
-    group = PAIR_GROUPS[group_idx]
-    LATEST_STATUS["last_group"] = group
+    pairs = get_pairs_for_session(session_name)
+    LATEST_STATUS["last_group"] = pairs
 
     best_signal = None
 
-    for symbol in group:
+    for symbol in pairs:
         try:
-            signal = signal_for_symbol(symbol)
+            # kara liste adayıysa şimdilik pas
+            for setup_name in ["EXHAUSTION_REVERSAL", "BREAKOUT_RETEST", "MOMENTUM_PULLBACK"]:
+                if is_blacklist_candidate(symbol, setup_name, session_name):
+                    pass
+
+            signal = signal_for_symbol(symbol, session_name)
             if not signal:
                 continue
 
@@ -915,6 +1229,10 @@ def scan():
                 continue
 
             if not should_send(signal):
+                continue
+
+            if is_blacklist_candidate(symbol, signal["setup"], session_name):
+                print(f"Blacklist candidate skipped: {symbol} {signal['setup']} {session_name}", flush=True)
                 continue
 
             if (best_signal is None) or (signal["confidence"] > best_signal["confidence"]):
@@ -929,7 +1247,7 @@ def scan():
         sent = send_telegram_message(message)
         if sent:
             mark_signal_sent(best_signal)
-            log_signal(best_signal)
+            log_signal(best_signal, session_name)
 
             LATEST_STATUS["last_signal"] = {
                 "symbol": best_signal["symbol"],
@@ -937,6 +1255,8 @@ def scan():
                 "direction": best_signal["direction"],
                 "confidence": best_signal["confidence"],
                 "rank": best_signal["rank"],
+                "session": session_name,
+                "learn_adjustment": best_signal.get("learn_adjustment", 0),
                 "time_ny": fmt_ny()
             }
             LATEST_STATUS["signals_sent_today"] += 1
@@ -985,6 +1305,31 @@ def stats():
     with STATE_LOCK:
         snapshot = dict(PAIR_STATS)
     return jsonify(snapshot)
+
+@app.route("/performance", methods=["GET"])
+def performance():
+    with STATE_LOCK:
+        snapshot = {
+            "by_pair": dict(PERFORMANCE_DB["by_pair"]),
+            "by_setup": dict(PERFORMANCE_DB["by_setup"]),
+            "by_session": dict(PERFORMANCE_DB["by_session"]),
+            "by_pair_setup": dict(PERFORMANCE_DB["by_pair_setup"]),
+            "by_pair_session": dict(PERFORMANCE_DB["by_pair_session"]),
+            "by_setup_session": dict(PERFORMANCE_DB["by_setup_session"]),
+            "by_conf_bucket": dict(PERFORMANCE_DB["by_conf_bucket"]),
+        }
+    return jsonify(snapshot)
+
+@app.route("/leaderboard", methods=["GET"])
+def leaderboard():
+    return jsonify({
+        "top_pairs": top_bucket_items("by_pair", limit=8),
+        "top_setups": top_bucket_items("by_setup", limit=8),
+        "top_sessions": top_bucket_items("by_session", limit=8),
+        "bottom_pairs": bottom_bucket_items("by_pair", limit=8),
+        "bottom_pair_setup": bottom_bucket_items("by_pair_setup", limit=8),
+        "conf_buckets": top_bucket_items("by_conf_bucket", limit=8, min_decisive=2),
+    })
 
 # =========================
 # START
