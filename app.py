@@ -52,7 +52,7 @@ PERFORMANCE_DB = {
     "by_pair_setup": {},
     "by_pair_session": {},
     "by_setup_session": {},
-    "by_conf_bucket": {},   # 40-49, 50-59...
+    "by_conf_bucket": {},
 }
 
 LATEST_STATUS = {
@@ -68,10 +68,12 @@ LATEST_STATUS = {
     "last_error": None,
     "last_signal": None,
     "signals_sent_today": 0,
+    "market_open": None,
+    "market_status": None,
 }
 
 HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "SilentSurgeLearn/3.0"})
+HTTP.headers.update({"User-Agent": "SilentSurgeLearn/4.0"})
 
 # =========================
 # SESSION / PAIR MAP
@@ -141,7 +143,7 @@ def confidence_bucket(conf):
 
 def send_telegram_message(text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram env missing", flush=True)
+        print("Telegram credentials missing.", flush=True)
         return False
 
     if len(text) > MAX_TELEGRAM_TEXT:
@@ -161,6 +163,30 @@ def send_telegram_message(text):
     except Exception as e:
         print(f"Telegram error: {e}", flush=True)
         return False
+
+# =========================
+# MARKET OPEN FILTER
+# =========================
+def get_market_status():
+    now = now_ny()
+    weekday = now.weekday()
+    hour = now.hour
+
+    # Monday = 0 ... Sunday = 6
+
+    if weekday == 5:
+        return False, "CLOSED_SATURDAY"
+
+    if weekday == 6 and hour < 17:
+        return False, "CLOSED_SUNDAY_PREOPEN"
+
+    if weekday == 4 and hour >= 17:
+        return False, "CLOSED_FRIDAY_POSTCLOSE"
+
+    return True, "OPEN"
+
+def is_market_open_now():
+    return get_market_status()[0]
 
 # =========================
 # SESSION ENGINE
@@ -783,7 +809,6 @@ def build_signal(symbol, setup, direction, current, prev, rsi_1m,
         rsi_1m, ema_fast, ema_slow, trend_5m, atr_1m, setup, market_state
     )
 
-    # öğrenen ayar
     learn_adj = performance_adjustment(symbol, setup, session_name, confidence)
     confidence = clamp(confidence + learn_adj, 40, 95)
 
@@ -1065,17 +1090,16 @@ def ensure_pair_stats(symbol):
 
 def update_pair_stats(symbol, result):
     ensure_pair_stats(symbol)
-    with STATE_LOCK:
-        stats = PAIR_STATS[symbol]
-        stats["signals"] += 1
-        if result == "WIN":
-            stats["wins"] += 1
-        elif result == "LOSS":
-            stats["losses"] += 1
-        elif result == "DRAW":
-            stats["draws"] += 1
-        decisive = stats["wins"] + stats["losses"]
-        stats["win_rate"] = round((stats["wins"] / decisive) * 100, 2) if decisive else 0.0
+    stats = PAIR_STATS[symbol]
+    stats["signals"] += 1
+    if result == "WIN":
+        stats["wins"] += 1
+    elif result == "LOSS":
+        stats["losses"] += 1
+    elif result == "DRAW":
+        stats["draws"] += 1
+    decisive = stats["wins"] + stats["losses"]
+    stats["win_rate"] = round((stats["wins"] / decisive) * 100, 2) if decisive else 0.0
 
 def log_signal(signal, session_name):
     entry = {
@@ -1199,11 +1223,18 @@ def scan():
     ny = now_ny()
     utc = now_utc()
     session_name = get_session_name(ny.hour)
+    market_open, market_status = get_market_status()
 
     LATEST_STATUS["last_scan_ny"] = fmt_ny(ny)
     LATEST_STATUS["last_scan_utc"] = utc.isoformat()
     LATEST_STATUS["last_session"] = session_name
     LATEST_STATUS["scanner_heartbeat_utc"] = utc.isoformat()
+    LATEST_STATUS["market_open"] = market_open
+    LATEST_STATUS["market_status"] = market_status
+
+    if not market_open:
+        print(f"Market closed: {market_status}", flush=True)
+        return
 
     if not is_tradeable_session(session_name):
         print(f"Session blocked: {session_name}", flush=True)
@@ -1216,11 +1247,6 @@ def scan():
 
     for symbol in pairs:
         try:
-            # kara liste adayıysa şimdilik pas
-            for setup_name in ["EXHAUSTION_REVERSAL", "BREAKOUT_RETEST", "MOMENTUM_PULLBACK"]:
-                if is_blacklist_candidate(symbol, setup_name, session_name):
-                    pass
-
             signal = signal_for_symbol(symbol, session_name)
             if not signal:
                 continue
@@ -1240,7 +1266,7 @@ def scan():
 
         except Exception as e:
             LATEST_STATUS["last_error"] = f"{symbol}: {str(e)}"
-            print(f"ERR {symbol}: {e}", flush=True)
+            print(f"Error on {symbol}: {e}", flush=True)
 
     if best_signal:
         message = build_message(best_signal, session_name)
@@ -1280,9 +1306,12 @@ def loop():
 # =========================
 @app.route("/", methods=["GET"])
 def home():
+    market_open, market_status = get_market_status()
     return jsonify({
         "status": "running",
         "time_ny": fmt_ny(),
+        "market_open": market_open,
+        "market_status": market_status,
         "session": get_session_name(now_ny().hour),
         "scanner_started": LATEST_STATUS["scanner_started"],
         "resolver_started": LATEST_STATUS["resolver_started"],
